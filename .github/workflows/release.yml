@@ -1,10 +1,11 @@
 name: Release
 
 on:
-  release:
-    types: [published]
   push:
     tags: ['v*']
+  # Triggered by pushing a v* tag. GoReleaser creates the GitHub release itself,
+  # so we intentionally do NOT also trigger on `release: published` (that would
+  # run this workflow a second time and GoReleaser would fail on the existing release).
 
 permissions:
   contents: write
