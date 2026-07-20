@@ -1,0 +1,17 @@
+site_name: thunderbird-mcp
+site_description: MCP server exposing a local Thunderbird profile (mail, contacts, calendar)
+repo_url: https://github.com/mudler/thunderbird-mcp
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle: {icon: material/weather-night, name: Dark mode}
+    - scheme: slate
+      primary: indigo
+      toggle: {icon: material/weather-sunny, name: Light mode}
+nav:
+  - Home: index.md
+  - Configuration: configuration.md
+  - Tools: tools.md
+  - Security: security.md

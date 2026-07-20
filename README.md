@@ -1,0 +1,125 @@
+# 🐦 thunderbird-mcp
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes a local **Thunderbird** profile — mail, contacts, and calendar — to an LLM.
+
+[![CI](https://github.com/mudler/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mudler/thunderbird-mcp/actions/workflows/ci.yml)
+[![Release](https://github.com/mudler/thunderbird-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/mudler/thunderbird-mcp/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![ghcr.io](https://img.shields.io/badge/ghcr.io-mudler%2Fthunderbird--mcp-blue?logo=docker)](https://github.com/mudler/thunderbird-mcp/pkgs/container/thunderbird-mcp)
+
+It works with any MCP client and is designed to pair with [LocalAI](https://localai.io/docs/features/mcp).
+
+---
+
+## What it does
+
+`thunderbird-mcp` reads Thunderbird's **own on-disk state** directly and uses **IMAP/SMTP** for anything live. There is no Thunderbird extension or add-on to install, and it works whether or not Thunderbird is running.
+
+| Data source | File in the profile | Access |
+| --- | --- | --- |
+| Accounts, SMTP, calendars | `prefs.js` | read |
+| Full-text search index | `global-messages-db.sqlite` (gloda) | read-only |
+| Credentials | `key4.db` + `logins.json` (NSS) | read-only, decrypted in pure Go |
+| Contacts | `abook.sqlite` | read-only |
+| Calendar | `calendar-data/local.sqlite` | read-only |
+| Live mail | IMAP / SMTP | fetch, mutate, send |
+
+It is a single, static, **CGO-free** Go binary.
+
+## Tools
+
+Three domain tools, each driven by an `action` enum:
+
+### `thunderbird_mail`
+`list_accounts`, `list_folders`, `search_messages`, `get_message`, `list_recent`, `set_flags`, `move_message`, `delete_message`, `send_mail`, `reply_message`, `forward_message`, `save_draft`
+
+### `thunderbird_contacts`
+`search_contacts`, `get_contact`
+
+### `thunderbird_calendar`
+`list_calendars`, `list_events`
+
+The `action` enum is built **dynamically**: write actions (`set_flags`/`move_message`/`delete_message`) appear only when writes are allowed, and send actions (`send_mail`/`reply_message`/`forward_message`/`save_draft`) only when `THUNDERBIRD_ALLOW_SEND=true`. A disabled action is not even present in the schema.
+
+See [docs/tools.md](docs/tools.md) for the full per-action parameter reference.
+
+## Safety model
+
+- **Never writes to any Thunderbird-owned file** (mbox/maildir/gloda/abook/calendar/`key4.db`/`logins.json`). Every SQLite database is opened read-only. All mutations go through IMAP, where the server syncs.
+- **Local (POP/Local Folders) accounts, contacts, and calendar are read-only.**
+- **Sending is gated** behind `THUNDERBIRD_ALLOW_SEND=true` (off by default). `THUNDERBIRD_READ_ONLY=true` disables every mutating and sending action.
+- Local message paths are resolved with **path-traversal protection** — a crafted `message_ref` cannot escape the profile directory.
+
+More detail in [docs/security.md](docs/security.md).
+
+## Configuration
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `THUNDERBIRD_PROFILE` | auto-discovered | path to the profile directory |
+| `THUNDERBIRD_READ_ONLY` | `false` | when `true`, mutating and sending actions are unavailable |
+| `THUNDERBIRD_ALLOW_SEND` | `false` | when `true`, the compose/send actions are enabled |
+| `THUNDERBIRD_TOOLS` | all | comma-separated allowlist of the three tool names |
+
+## Quick start
+
+### Docker
+
+```bash
+docker run -i --rm --network host \
+  -e THUNDERBIRD_PROFILE=/profile \
+  -v "$HOME/.thunderbird/xxxx.default-release:/profile:ro" \
+  ghcr.io/mudler/thunderbird-mcp:latest
+```
+
+`--network host` lets the container reach your IMAP/SMTP servers; mounting the profile read-only is recommended (the server never writes to it).
+
+### From source
+
+```bash
+go install github.com/mudler/thunderbird-mcp@latest
+THUNDERBIRD_PROFILE=~/.thunderbird/xxxx.default-release thunderbird-mcp
+```
+
+### LocalAI
+
+Add to your model configuration:
+
+```yaml
+mcp:
+  stdio: |
+    {
+      "mcpServers": {
+        "thunderbird": {
+          "command": "docker",
+          "args": [
+            "run", "-i", "--rm", "--network", "host",
+            "-e", "THUNDERBIRD_PROFILE=/profile",
+            "-e", "THUNDERBIRD_ALLOW_SEND=false",
+            "-v", "/home/user/.thunderbird/xxxx.default-release:/profile:ro",
+            "ghcr.io/mudler/thunderbird-mcp:latest"
+          ]
+        }
+      }
+    }
+```
+
+## Limitations (non-goals)
+
+- **OAuth2** accounts are not supported for live IMAP/SMTP (most Gmail/Outlook setups). They still appear in index search; live fetch/send report a clear "unsupported" error.
+- A profile protected by a **master password** cannot have its credentials decrypted — the server logs a warning and keeps the read-only search/contacts/calendar tools working.
+- No calendar or contact **writes**.
+
+## Development
+
+```bash
+go test ./...          # ginkgo suite
+go vet ./...
+CGO_ENABLED=0 go build .
+```
+
+The credential-decryption path is covered by a regression test against a **real** NSS `key4.db`/`logins.json` fixture (generated by the NSS library itself), in addition to synthetic round-trip tests.
+
+## License
+
+[MIT](./LICENSE)

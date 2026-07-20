@@ -1,0 +1,4 @@
+/thunderbird-mcp
+*.test
+*.out
+dist/
