@@ -38,7 +38,9 @@ Establishes the type and the uncontended read path. No snapshot logic yet.
   - `func openDBSource(path, name string) (*dbSource, error)`
   - `func (s *dbSource) Query(q string, args ...any) (*sql.Rows, error)`
   - `func (s *dbSource) Close() error`
-  - test helper `func writeWALFixture(dir string) string` — creates a WAL database with table `t(x TEXT)` holding rows `a`,`b`,`c`, closes its writer, returns the db path.
+  - test fixture `walFixture` with `newWALFixture(dir string) *walFixture`, `(*walFixture).lock()`, `(*walFixture).close()`, and field `path`.
+
+**Fixture note — this is load-bearing.** `newWALFixture` **keeps its writing connection open**. Closing it would checkpoint the WAL and delete the `-wal` file, moving every row into the main database. A fixture in that state cannot detect the bug being fixed: `immutable=1` reads a checkpointed database perfectly well, so the Task 5 regression test would pass against the broken code. Verified: after closing the writer, `-wal` is gone and `immutable=1` returns all 3 rows. Do not "simplify" this fixture by closing the writer.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -48,6 +50,7 @@ Create `dbsource_test.go`:
 package main
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -57,19 +60,62 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// writeWALFixture creates a WAL-mode database with three committed rows and
-// closes its writer, so the WAL is checkpointed and nothing holds a lock.
-func writeWALFixture(dir string) string {
+// walFixture is a WAL-mode database standing in for a live Thunderbird
+// profile. Its writing connection stays OPEN for the fixture's lifetime, so
+// the committed rows remain un-checkpointed in the -wal. That is the whole
+// point: closing the writer would checkpoint the WAL away and the resulting
+// database would be readable even by the broken immutable=1 path.
+type walFixture struct {
+	path string
+	db   *sql.DB
+	conn *sql.Conn
+	tx   *sql.Tx
+}
+
+// newWALFixture creates the database with three committed rows in the WAL.
+func newWALFixture(dir string) *walFixture {
 	path := filepath.Join(dir, "fixture.sqlite")
 	db, err := sql.Open("sqlite", "file:"+path)
 	Expect(err).NotTo(HaveOccurred())
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(1) // one connection, so lock() acts on the writer itself
+
 	var jm string
 	Expect(db.QueryRow("PRAGMA journal_mode=WAL").Scan(&jm)).To(Succeed())
+	Expect(jm).To(Equal("wal"))
 	_, err = db.Exec("CREATE TABLE t(x TEXT); INSERT INTO t VALUES('a'),('b'),('c')")
 	Expect(err).NotTo(HaveOccurred())
-	Expect(db.Close()).To(Succeed())
-	return path
+
+	// Guard the premise: if the -wal is missing, the rows were checkpointed
+	// and every test built on this fixture is silently weaker than it looks.
+	_, err = os.Stat(path + "-wal")
+	Expect(err).NotTo(HaveOccurred(), "fixture must leave rows un-checkpointed in the -wal")
+
+	return &walFixture{path: path, db: db}
+}
+
+// lock makes the fixture reject readers, the way a running Thunderbird does:
+// an exclusive lock plus an open, uncommitted write on the same connection.
+func (f *walFixture) lock() {
+	ctx := context.Background()
+	conn, err := f.db.Conn(ctx)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = conn.ExecContext(ctx, "PRAGMA locking_mode=EXCLUSIVE")
+	Expect(err).NotTo(HaveOccurred())
+	tx, err := conn.BeginTx(ctx, nil)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = tx.ExecContext(ctx, "INSERT INTO t VALUES('uncommitted')")
+	Expect(err).NotTo(HaveOccurred())
+	f.conn, f.tx = conn, tx
+}
+
+func (f *walFixture) close() {
+	if f.tx != nil {
+		_ = f.tx.Rollback()
+	}
+	if f.conn != nil {
+		_ = f.conn.Close()
+	}
+	_ = f.db.Close()
 }
 
 func countVia(s *dbSource) (int, error) {
@@ -93,7 +139,12 @@ var _ = Describe("dbSource", func() {
 	BeforeEach(func() { dir = GinkgoT().TempDir() })
 
 	It("reads an uncontended database", func() {
-		s, err := openDBSource(writeWALFixture(dir), "fixture")
+		// A plain reader coexists with an active WAL writer; only an
+		// exclusive lock causes contention.
+		f := newWALFixture(dir)
+		defer f.close()
+
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		defer s.Close()
 
@@ -250,67 +301,59 @@ The heart of the fix. A locked database is read through a copy that includes the
 - Modify: `dbsource_test.go`
 
 **Interfaces:**
-- Consumes: `dbSource`, `openDBSource`, `isBusy`, `sqliteCodeIn`, `writeWALFixture`, `countVia` from Task 1.
+- Consumes: `dbSource`, `openDBSource`, `isBusy`, `sqliteCodeIn`, `walFixture`, `newWALFixture`, `countVia` from Task 1.
 - Produces:
   - `func (s *dbSource) refreshSnapshot() error`
   - `func (s *dbSource) makeSnapshot(mod time.Time) error`
   - `func copyFile(src, dst string) error`
   - field `copyFile func(src, dst string) error` on `dbSource` (test seam, defaults to the package-level `copyFile`)
-  - test helper `func lockExclusive(path string) func()` — holds an exclusive lock plus an uncommitted write, returns a release func.
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `dbsource_test.go`, and add `"context"` and `"time"` to its imports:
+Append to `dbsource_test.go`, and add `"time"` to its imports:
 
 ```go
-// lockExclusive reproduces a running Thunderbird: an exclusive lock plus an
-// open, uncommitted write transaction, on a connection whose committed rows
-// are still sitting un-checkpointed in the WAL. Returns a release func.
-func lockExclusive(path string) func() {
-	ctx := context.Background()
-	db, err := sql.Open("sqlite", "file:"+path)
-	Expect(err).NotTo(HaveOccurred())
-	db.SetMaxOpenConns(1)
-
-	conn, err := db.Conn(ctx)
-	Expect(err).NotTo(HaveOccurred())
-	_, err = conn.ExecContext(ctx, "PRAGMA locking_mode=EXCLUSIVE")
-	Expect(err).NotTo(HaveOccurred())
-	tx, err := conn.BeginTx(ctx, nil)
-	Expect(err).NotTo(HaveOccurred())
-	_, err = tx.ExecContext(ctx, "INSERT INTO t VALUES('uncommitted')")
-	Expect(err).NotTo(HaveOccurred())
-
-	return func() {
-		_ = tx.Rollback()
-		_ = conn.Close()
-		_ = db.Close()
-	}
-}
-
 var _ = Describe("dbSource under contention", func() {
-	var dir, path string
+	var dir string
+	var f *walFixture
 	BeforeEach(func() {
 		dir = GinkgoT().TempDir()
-		path = writeWALFixture(dir)
+		f = newWALFixture(dir)
 	})
+	AfterEach(func() { f.close() })
 
 	It("falls back to a snapshot when the live file is locked", func() {
-		release := lockExclusive(path)
-		defer release()
+		f.lock()
 
-		s, err := openDBSource(path, "fixture")
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		defer s.Close()
 
 		n, err := countVia(s)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(n).To(Equal(3)) // committed rows only, not the uncommitted one
+		// 3 proves two things at once: the read survived the lock, and the
+		// copy included the -wal (all three rows live there un-checkpointed).
+		// The uncommitted 4th row must not appear.
+		Expect(n).To(Equal(3))
 		Expect(s.snap).NotTo(BeNil())
 	})
 
+	It("cannot read the locked file live", func() {
+		f.lock()
+
+		// Guards the premise of the test above: if this ever stops returning
+		// BUSY, the fallback spec would pass without exercising the fallback.
+		live, err := sql.Open("sqlite", "file:"+f.path+"?mode=ro&_pragma=busy_timeout(200)")
+		Expect(err).NotTo(HaveOccurred())
+		defer live.Close()
+		var n int
+		err = live.QueryRow("SELECT count(*) FROM t").Scan(&n)
+		Expect(err).To(HaveOccurred())
+		Expect(isBusy(err)).To(BeTrue())
+	})
+
 	It("does not snapshot when the query itself is bad", func() {
-		s, err := openDBSource(path, "fixture")
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		defer s.Close()
 
@@ -320,10 +363,9 @@ var _ = Describe("dbSource under contention", func() {
 	})
 
 	It("removes the snapshot directory on Close", func() {
-		release := lockExclusive(path)
-		defer release()
+		f.lock()
 
-		s, err := openDBSource(path, "fixture")
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		_, err = countVia(s)
 		Expect(err).NotTo(HaveOccurred())
@@ -512,7 +554,7 @@ func (s *dbSource) Close() error {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `go test ./... 2>&1 | tail -20`
-Expected: PASS. The fallback spec proves both halves at once — the read survives the lock, and `rows=3` proves the snapshot picked up un-checkpointed WAL data that `immutable=1` would have missed.
+Expected: PASS. The fallback spec proves both halves at once — the read survives the lock, and because the fixture's writer is still open, all three rows are un-checkpointed WAL content, so `rows=3` also proves the copy included the `-wal`.
 
 - [ ] **Step 5: Commit**
 
@@ -540,17 +582,18 @@ Append to `dbsource_test.go`:
 
 ```go
 var _ = Describe("dbSource snapshot refresh policy", func() {
-	var dir, path string
+	var dir string
+	var f *walFixture
 	BeforeEach(func() {
 		dir = GinkgoT().TempDir()
-		path = writeWALFixture(dir)
+		f = newWALFixture(dir)
 	})
+	AfterEach(func() { f.close() })
 
 	It("reuses a warm snapshot without copying again", func() {
-		release := lockExclusive(path)
-		defer release()
+		f.lock()
 
-		s, err := openDBSource(path, "fixture")
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		defer s.Close()
 
@@ -572,10 +615,9 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 	})
 
 	It("keeps the existing copy when the TTL lapses but the source has not changed", func() {
-		release := lockExclusive(path)
-		defer release()
+		f.lock()
 
-		s, err := openDBSource(path, "fixture")
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		defer s.Close()
 
@@ -595,10 +637,9 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 	})
 
 	It("re-copies once the source has changed", func() {
-		release := lockExclusive(path)
-		defer release()
+		f.lock()
 
-		s, err := openDBSource(path, "fixture")
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		defer s.Close()
 
@@ -653,17 +694,18 @@ Append to `dbsource_test.go`:
 
 ```go
 var _ = Describe("dbSource snapshot failures", func() {
-	var dir, path string
+	var dir string
+	var f *walFixture
 	BeforeEach(func() {
 		dir = GinkgoT().TempDir()
-		path = writeWALFixture(dir)
+		f = newWALFixture(dir)
 	})
+	AfterEach(func() { f.close() })
 
 	It("re-copies once when the first snapshot came out torn", func() {
-		release := lockExclusive(path)
-		defer release()
+		f.lock()
 
-		s, err := openDBSource(path, "fixture")
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		defer s.Close()
 
@@ -686,10 +728,9 @@ var _ = Describe("dbSource snapshot failures", func() {
 	})
 
 	It("gives an actionable error when the snapshot cannot be written", func() {
-		release := lockExclusive(path)
-		defer release()
+		f.lock()
 
-		s, err := openDBSource(path, "fixture")
+		s, err := openDBSource(f.path, "fixture")
 		Expect(err).NotTo(HaveOccurred())
 		defer s.Close()
 
@@ -792,36 +833,55 @@ Switches all three sources onto `dbSource` and removes the unsafe DSNs.
 Append to `dbsource_test.go` — a regression test proving the three sources survive a locked profile:
 
 ```go
+// seededLiveDB writes seedFile into a WAL database and returns it in the state
+// a running Thunderbird leaves its profile: the writing connection still open
+// (so the seeded rows are un-checkpointed WAL content), holding an exclusive
+// lock and an uncommitted write. Caller must call the returned release func.
+//
+// The connection must stay open. Closing it checkpoints the WAL into the main
+// file, and a checkpointed database reads fine through immutable=1 - which
+// would make this test pass against the very bug it exists to catch.
+func seededLiveDB(dir, name, seedFile, blockingWrite string) (string, func()) {
+	ctx := context.Background()
+	path := filepath.Join(dir, name)
+
+	seed, err := os.ReadFile(seedFile)
+	Expect(err).NotTo(HaveOccurred())
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	Expect(err).NotTo(HaveOccurred())
+	db.SetMaxOpenConns(1)
+
+	var jm string
+	Expect(db.QueryRow("PRAGMA journal_mode=WAL").Scan(&jm)).To(Succeed())
+	Expect(jm).To(Equal("wal"))
+	_, err = db.Exec(string(seed))
+	Expect(err).NotTo(HaveOccurred())
+
+	_, err = os.Stat(path + "-wal")
+	Expect(err).NotTo(HaveOccurred(), "seed must stay un-checkpointed in the -wal")
+
+	conn, err := db.Conn(ctx)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = conn.ExecContext(ctx, "PRAGMA locking_mode=EXCLUSIVE")
+	Expect(err).NotTo(HaveOccurred())
+	tx, err := conn.BeginTx(ctx, nil)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = tx.ExecContext(ctx, blockingWrite)
+	Expect(err).NotTo(HaveOccurred())
+
+	return path, func() {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		_ = db.Close()
+	}
+}
+
 var _ = Describe("profile sources under a locked profile", func() {
 	It("serves contacts while the address book is locked", func() {
-		dir := GinkgoT().TempDir()
-		path := filepath.Join(dir, "abook.sqlite")
-
-		seed, err := os.ReadFile("testdata/abook_seed.sql")
-		Expect(err).NotTo(HaveOccurred())
-		db, err := sql.Open("sqlite", "file:"+path)
-		Expect(err).NotTo(HaveOccurred())
-		db.SetMaxOpenConns(1)
-		var jm string
-		Expect(db.QueryRow("PRAGMA journal_mode=WAL").Scan(&jm)).To(Succeed())
-		_, err = db.Exec(string(seed))
-		Expect(err).NotTo(HaveOccurred())
-		Expect(db.Close()).To(Succeed())
-
-		// Lock it the way a running Thunderbird would.
-		ctx := context.Background()
-		lock, err := sql.Open("sqlite", "file:"+path)
-		Expect(err).NotTo(HaveOccurred())
-		lock.SetMaxOpenConns(1)
-		conn, err := lock.Conn(ctx)
-		Expect(err).NotTo(HaveOccurred())
-		_, err = conn.ExecContext(ctx, "PRAGMA locking_mode=EXCLUSIVE")
-		Expect(err).NotTo(HaveOccurred())
-		tx, err := conn.BeginTx(ctx, nil)
-		Expect(err).NotTo(HaveOccurred())
-		_, err = tx.ExecContext(ctx, "DELETE FROM properties")
-		Expect(err).NotTo(HaveOccurred())
-		defer func() { _ = tx.Rollback(); _ = conn.Close(); _ = lock.Close() }()
+		path, release := seededLiveDB(GinkgoT().TempDir(), "abook.sqlite",
+			"testdata/abook_seed.sql", "DELETE FROM properties")
+		defer release()
 
 		c, err := openContactsAt(path)
 		Expect(err).NotTo(HaveOccurred())
@@ -832,13 +892,33 @@ var _ = Describe("profile sources under a locked profile", func() {
 		Expect(res).To(HaveLen(1))
 		Expect(res[0].Email).To(Equal("bob@example.com"))
 	})
+
+	It("serves calendar events while the calendar is locked", func() {
+		path, release := seededLiveDB(GinkgoT().TempDir(), "local.sqlite",
+			"testdata/calendar_seed.sql", "DELETE FROM cal_events")
+		defer release()
+
+		cal, err := openCalendarAt(path, map[string]string{})
+		Expect(err).NotTo(HaveOccurred())
+		defer cal.Close()
+
+		// Widest possible window, so this asserts "reads succeed under a lock"
+		// rather than re-testing the date filtering calendar_test.go covers.
+		evs, err := cal.Events(time.UnixMicro(0), time.Now().AddDate(100, 0, 0), 50)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(evs).NotTo(BeEmpty())
+	})
 })
 ```
+
+If `calendar_seed.sql` seeds events outside that window, or the table names differ, adjust the assertion to match the fixture rather than editing the fixture. Check with: `grep -n "INSERT INTO" testdata/calendar_seed.sql`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./... 2>&1 | tail -30`
-Expected: FAIL. With `immutable=1` still in place the read does not block, but the WAL-resident seed data is invisible, so this fails with `no such table: properties` or an empty result.
+Expected: **FAIL** for both new specs with `no such table: properties` / `no such table: cal_events`. This is the bug itself: `immutable=1` ignores the `-wal`, where the seeded schema and rows live, so it reports the tables as absent rather than erroring on the lock.
+
+If either spec *passes* at this step, stop — the fixture checkpointed its WAL and the test is not exercising the bug. Do not proceed to Step 3 until both fail for the stated reason.
 
 - [ ] **Step 3: Write the implementation**
 
