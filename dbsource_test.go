@@ -278,13 +278,23 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(n).To(Equal(3))
 		Expect(copies).To(Equal(0)) // mtime unchanged, so no new copy
-		// The window must be extended, not merely left lapsed. This is also the
-		// provenance check: n==3 and copies==0 are both consistent with a plain
-		// successful live read, so only an advanced snapAt proves the fallback
-		// ran and kept the existing copy. Without the extension every later call
-		// re-probes the locked live file and burns the full 5000ms busy_timeout
-		// before falling back - exactly the cost snapshotTTL exists to bound.
+		// Provenance only: n==3 and copies==0 are both consistent with a plain
+		// successful live read, so an advanced snapAt is what proves the
+		// fallback ran at all and kept the existing copy. It does NOT pin the
+		// window extension - any value newer than stale satisfies it, including
+		// ones that leave the TTL still lapsed.
 		Expect(s.snapAt).To(BeTemporally(">", stale))
+
+		// The extension itself, pinned by its consequence: the gate must have
+		// re-armed, so the next call takes the warm rung outright and never
+		// re-enters refreshSnapshot (which would move snapAt again). Without a
+		// real extension every later call re-probes the locked live file and
+		// burns the full 5000ms busy_timeout before falling back - exactly the
+		// cost snapshotTTL exists to bound.
+		warmed := s.snapAt
+		_, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(s.snapAt).To(Equal(warmed)) // the next call took the warm rung outright
 	})
 
 	It("re-copies once the source has changed", func() {
