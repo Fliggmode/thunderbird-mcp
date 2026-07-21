@@ -481,6 +481,32 @@ var _ = Describe("profile sources under a locked profile", func() {
 		Expect(res[0].Email).To(Equal("bob@example.com"))
 	})
 
+	It("serves gloda search results while the index is locked", func() {
+		// Gloda is the most-contended reader in practice: Thunderbird's
+		// indexer writes it constantly, and it is the reader the original
+		// locked-profile bug was reported against.
+		path, release := seededLiveDB(GinkgoT().TempDir(), "global-messages-db.sqlite",
+			"testdata/gloda_seed.sql", "DELETE FROM messagesText_content")
+		defer release()
+
+		g, err := openGlodaAt(path)
+		Expect(err).NotTo(HaveOccurred())
+		defer g.Close()
+
+		res, err := g.Search(SearchQuery{Text: "report", Limit: 10})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res).To(HaveLen(1))
+		Expect(res[0].Subject).To(Equal("Quarterly report"))
+		Expect(res[0].Ref).To(Equal("imap://alice@example.com/INBOX#101"))
+
+		// A second query goes through the warm snapshot; the deleted and
+		// ghost rows must still be excluded from it.
+		recent, err := g.Recent("", 10)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(recent).To(HaveLen(3))
+		Expect(recent[0].Subject).To(Equal("Lunch"))
+	})
+
 	It("serves calendar events while the calendar is locked", func() {
 		path, release := seededLiveDB(GinkgoT().TempDir(), "local.sqlite",
 			"testdata/calendar_seed.sql", "DELETE FROM cal_events")
