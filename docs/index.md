@@ -11,6 +11,14 @@ It reads Thunderbird's own on-disk state directly (`prefs.js`, the gloda search 
 ## Install
 
 ```bash
+curl -fsSL https://mudler.github.io/thunderbird-mcp/install.sh | sh
+```
+
+The script installs the latest release binary (Linux/macOS, amd64/arm64) to `~/.local/bin` after verifying its checksum. Set `BINDIR` to change the destination and `VERSION` to pin a release.
+
+Alternatives:
+
+```bash
 docker pull ghcr.io/mudler/thunderbird-mcp:latest
 # or
 go install github.com/mudler/thunderbird-mcp@latest

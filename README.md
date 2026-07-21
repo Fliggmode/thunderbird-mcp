@@ -63,6 +63,14 @@ More detail in [docs/security.md](docs/security.md).
 
 ## Quick start
 
+### One-liner (Linux/macOS)
+
+```bash
+curl -fsSL https://mudler.github.io/thunderbird-mcp/install.sh | sh
+```
+
+Installs the latest release binary (amd64/arm64) to `~/.local/bin` after verifying its checksum against the release's `checksums.txt`. `BINDIR=/usr/local/bin` changes the destination, `VERSION=v0.1.0` pins a release.
+
 ### Docker
 
 ```bash
