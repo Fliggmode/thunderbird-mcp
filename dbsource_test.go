@@ -420,3 +420,80 @@ var _ = Describe("dbSource snapshot failures", func() {
 		Expect(err.Error()).NotTo(ContainSubstring("Thunderbird is holding")) // and the caller got the real error
 	})
 })
+
+// seededLiveDB writes seedFile into a WAL database and returns it in the state
+// a running Thunderbird leaves its profile: the writing connection still open
+// (so the seeded rows are un-checkpointed WAL content), holding an exclusive
+// lock and an uncommitted write. Caller must call the returned release func.
+//
+// The connection must stay open. Closing it checkpoints the WAL into the main
+// file, and a checkpointed database reads fine through immutable=1 - which
+// would make this test pass against the very bug it exists to catch.
+func seededLiveDB(dir, name, seedFile, blockingWrite string) (string, func()) {
+	ctx := context.Background()
+	path := filepath.Join(dir, name)
+
+	seed, err := os.ReadFile(seedFile)
+	Expect(err).NotTo(HaveOccurred())
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	Expect(err).NotTo(HaveOccurred())
+	db.SetMaxOpenConns(1)
+
+	var jm string
+	Expect(db.QueryRow("PRAGMA journal_mode=WAL").Scan(&jm)).To(Succeed())
+	Expect(jm).To(Equal("wal"))
+	_, err = db.Exec(string(seed))
+	Expect(err).NotTo(HaveOccurred())
+
+	_, err = os.Stat(path + "-wal")
+	Expect(err).NotTo(HaveOccurred(), "seed must stay un-checkpointed in the -wal")
+
+	conn, err := db.Conn(ctx)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = conn.ExecContext(ctx, "PRAGMA locking_mode=EXCLUSIVE")
+	Expect(err).NotTo(HaveOccurred())
+	tx, err := conn.BeginTx(ctx, nil)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = tx.ExecContext(ctx, blockingWrite)
+	Expect(err).NotTo(HaveOccurred())
+
+	return path, func() {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		_ = db.Close()
+	}
+}
+
+var _ = Describe("profile sources under a locked profile", func() {
+	It("serves contacts while the address book is locked", func() {
+		path, release := seededLiveDB(GinkgoT().TempDir(), "abook.sqlite",
+			"testdata/abook_seed.sql", "DELETE FROM properties")
+		defer release()
+
+		c, err := openContactsAt(path)
+		Expect(err).NotTo(HaveOccurred())
+		defer c.Close()
+
+		res, err := c.Search("bob", 10)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res).To(HaveLen(1))
+		Expect(res[0].Email).To(Equal("bob@example.com"))
+	})
+
+	It("serves calendar events while the calendar is locked", func() {
+		path, release := seededLiveDB(GinkgoT().TempDir(), "local.sqlite",
+			"testdata/calendar_seed.sql", "DELETE FROM cal_events")
+		defer release()
+
+		cal, err := openCalendarAt(path, map[string]string{})
+		Expect(err).NotTo(HaveOccurred())
+		defer cal.Close()
+
+		// Widest possible window, so this asserts "reads succeed under a lock"
+		// rather than re-testing the date filtering calendar_test.go covers.
+		evs, err := cal.Events(time.UnixMicro(0), time.Now().AddDate(100, 0, 0), 50)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(evs).NotTo(BeEmpty())
+	})
+})

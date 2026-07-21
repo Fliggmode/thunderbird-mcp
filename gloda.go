@@ -1,17 +1,14 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
-type Gloda struct{ db *sql.DB }
+type Gloda struct{ db *dbSource }
 
 // OpenGloda opens global-messages-db.sqlite read-only. Returns (nil, nil) when
 // the index is absent so callers can degrade gracefully.
@@ -24,12 +21,11 @@ func OpenGloda(profileDir string) (*Gloda, error) {
 }
 
 func openGlodaAt(path string) (*Gloda, error) {
-	// mode=ro + a busy timeout so we coexist with a running Thunderbird's indexer.
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	src, err := openDBSource(path, "gloda")
 	if err != nil {
 		return nil, err
 	}
-	return &Gloda{db: db}, nil
+	return &Gloda{db: src}, nil
 }
 
 func (g *Gloda) Close() error {

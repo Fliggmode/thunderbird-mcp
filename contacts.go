@@ -4,11 +4,9 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-
-	_ "modernc.org/sqlite"
 )
 
-type Contacts struct{ db *sql.DB }
+type Contacts struct{ db *dbSource }
 
 func OpenContacts(profileDir string) (*Contacts, error) {
 	p := filepath.Join(profileDir, "abook.sqlite")
@@ -19,11 +17,11 @@ func OpenContacts(profileDir string) (*Contacts, error) {
 }
 
 func openContactsAt(path string) (*Contacts, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1")
+	src, err := openDBSource(path, "contacts")
 	if err != nil {
 		return nil, err
 	}
-	return &Contacts{db: db}, nil
+	return &Contacts{db: src}, nil
 }
 
 func (c *Contacts) Close() error {

@@ -5,12 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 type Calendar struct {
-	db    *sql.DB
+	db    *dbSource
 	names map[string]string // cal_id -> display name
 }
 
@@ -27,11 +25,11 @@ func OpenCalendar(profileDir string, cals []CalendarRef) (*Calendar, error) {
 }
 
 func openCalendarAt(path string, names map[string]string) (*Calendar, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1")
+	src, err := openDBSource(path, "calendar")
 	if err != nil {
 		return nil, err
 	}
-	return &Calendar{db: db, names: names}, nil
+	return &Calendar{db: src, names: names}, nil
 }
 
 func (c *Calendar) Close() error {
