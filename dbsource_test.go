@@ -298,6 +298,54 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 		Expect(s.snapAt).To(Equal(warmed)) // the next call took the warm rung outright
 	})
 
+	It("re-copies when only the -wal has changed", func() {
+		// The case the mtime-only check missed. In WAL mode Thunderbird's
+		// writes land in the -wal, and the main file's mtime need not move
+		// until a checkpoint - so watching it alone leaves the snapshot stale
+		// past its TTL while Thunderbird keeps writing.
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		_, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+
+		var copies int
+		real := s.copyFile
+		s.copyFile = func(src, dst string) error { copies++; return real(src, dst) }
+
+		// Grow the -wal the way a committing writer would, then put the main
+		// file's mtime back exactly where it was. Trailing bytes past the last
+		// valid frame fail their checksum and are ignored by recovery, so the
+		// copy still reads as the same three rows.
+		before, err := os.Stat(s.path)
+		Expect(err).NotTo(HaveOccurred())
+
+		wal, err := os.OpenFile(s.path+"-wal", os.O_WRONLY|os.O_APPEND, 0o600)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = wal.Write(make([]byte, 4096))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(wal.Close()).To(Succeed())
+
+		Expect(os.Chtimes(s.path, before.ModTime(), before.ModTime())).To(Succeed())
+
+		// Guard the premise: if the main file's mtime did move, this test would
+		// pass on the old mtime-only check too and prove nothing.
+		after, err := os.Stat(s.path)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(after.ModTime()).To(BeTemporally("==", before.ModTime()),
+			"the main file must look untouched, or the -wal is not what triggers the re-copy")
+
+		s.snapAt = time.Now().Add(-2 * snapshotTTL) // expire the warm window
+
+		n, err := countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(copies).To(Equal(2)) // main + -wal: the WAL growth forced a fresh copy
+		Expect(n).To(Equal(3))      // and the fresh copy is still correct
+	})
+
 	It("re-copies once the source has changed", func() {
 		f.lock()
 

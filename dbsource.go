@@ -37,6 +37,45 @@ type dbSource struct {
 	snapSub string    // current generation's subdirectory inside snapDir
 	snapAt  time.Time // when snap was taken
 	srcMod  time.Time // mtime of path when snap was taken
+	walMod  time.Time // mtime of path+"-wal" when snap was taken; zero if absent
+	walSize int64     // size of path+"-wal" when snap was taken; 0 if absent
+}
+
+// srcState fingerprints what the snapshot was made from. The -wal belongs in
+// it because in WAL mode Thunderbird's writes land in the -wal first and the
+// main file's mtime need not move until a checkpoint. Watching the main file
+// alone lets a snapshot stay stale indefinitely while writes keep arriving.
+// Size matters as much as mtime: WAL growth is how new data announces itself,
+// and a same-second append would otherwise read as "unchanged".
+type srcState struct {
+	mod     time.Time
+	walMod  time.Time
+	walSize int64
+}
+
+// statSource fingerprints the main file and its -wal. A missing -wal is not an
+// error: it disappears legitimately when Thunderbird checkpoints. Its absence
+// is recorded as the zero state, which differs from any present -wal, so a
+// checkpoint that empties it still reads as a change worth re-copying for.
+func (s *dbSource) statSource() (srcState, error) {
+	st, err := os.Stat(s.path)
+	if err != nil {
+		return srcState{}, err
+	}
+	out := srcState{mod: st.ModTime()}
+	wst, err := os.Stat(s.path + "-wal")
+	switch {
+	case err == nil:
+		out.walMod, out.walSize = wst.ModTime(), wst.Size()
+	case !errors.Is(err, os.ErrNotExist):
+		return srcState{}, err
+	}
+	return out, nil
+}
+
+// matches reports whether the snapshot was taken from exactly this state.
+func (s *dbSource) matches(st srcState) bool {
+	return st.mod.Equal(s.srcMod) && st.walMod.Equal(s.walMod) && st.walSize == s.walSize
 }
 
 func openDBSource(path, name string) (*dbSource, error) {
@@ -98,30 +137,30 @@ func (s *dbSource) Query(q string, args ...any) (*sql.Rows, error) {
 // mtime is unchanged since the torn copy, so it would hand back the very
 // snapshot we just rejected.
 func (s *dbSource) makeSnapshotNow() error {
-	st, err := os.Stat(s.path)
+	st, err := s.statSource()
 	if err != nil {
 		return s.snapshotErr(err)
 	}
 	// makeSnapshot allocates the next generation directory, so the retry
 	// writes to a path of its own and never rewrites the torn file in place.
-	return s.makeSnapshot(st.ModTime())
+	return s.makeSnapshot(st)
 }
 
 // refreshSnapshot ensures s.snap is usable, re-copying only when the source
 // has actually changed since the last copy.
 func (s *dbSource) refreshSnapshot() error {
-	st, err := os.Stat(s.path)
+	st, err := s.statSource()
 	if err != nil {
 		return s.snapshotErr(err)
 	}
-	if s.snap != nil && st.ModTime().Equal(s.srcMod) {
+	if s.snap != nil && s.matches(st) {
 		s.snapAt = time.Now() // unchanged source; keep the copy, extend the window
 		return nil
 	}
-	return s.makeSnapshot(st.ModTime())
+	return s.makeSnapshot(st)
 }
 
-func (s *dbSource) makeSnapshot(mod time.Time) error {
+func (s *dbSource) makeSnapshot(st srcState) error {
 	if s.snap != nil {
 		s.snap.Close()
 		s.snap = nil
@@ -170,7 +209,8 @@ func (s *dbSource) makeSnapshot(mod time.Time) error {
 	if prev != "" {
 		_ = os.RemoveAll(prev)
 	}
-	s.snap, s.snapAt, s.srcMod = db, time.Now(), mod
+	s.snap, s.snapAt = db, time.Now()
+	s.srcMod, s.walMod, s.walSize = st.mod, st.walMod, st.walSize
 	return nil
 }
 
