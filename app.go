@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -61,6 +62,20 @@ func loadAppFromConfig(cfg *Config, creds *Credentials, readOnly, allowSend bool
 		a.Calendar = c
 	}
 	return a, nil
+}
+
+// Close releases every data source the app opened. Its main job is deleting
+// the snapshot directories dbSource creates under $TMPDIR: those hold a full
+// copy of the database (gloda routinely runs to hundreds of MB) and /tmp is
+// RAM-backed on most Linux systems, so leaking them across runs is expensive.
+//
+// Nil-safe at both levels. The app itself may be nil, and each source may be
+// nil because Open* returns (nil, nil) when the profile file is absent.
+func (a *App) Close() error {
+	if a == nil {
+		return nil
+	}
+	return errors.Join(a.Gloda.Close(), a.Contacts.Close(), a.Calendar.Close())
 }
 
 func (a *App) folderIsLocal(folderURI string) bool {
