@@ -34,14 +34,33 @@ or a long write transaction.
 When that happens, the server transparently copies the locked database (and its
 `-wal` write-ahead log, which holds everything not yet checkpointed) to a
 temporary directory and reads the copy instead. A copy is reused for up to 60
-seconds, and after that it is re-made only if the source file actually changed,
-so an actively indexing Thunderbird does not cause a copy per request. Copies
-live under the system temporary directory (`$TMPDIR`) and are removed when the
-server exits.
+seconds, and after that it is re-made only if the source actually changed, so an
+actively indexing Thunderbird does not cause a copy per request.
 
-If a database is locked and the copy cannot be written, most often because
-`$TMPDIR` is full, the request fails with an error naming the cause rather than
-returning incomplete results.
+Two consequences are worth knowing about:
+
+- **Results can be up to 60 seconds stale.** Within that window the warm copy is
+  served without consulting the live file at all, so a read can lag Thunderbird
+  even after Thunderbird has released the lock.
+- **The first request against a locked profile copies the whole database.** For a
+  large search index that is not instant.
+
+Copies live under the system temporary directory (`$TMPDIR`) and are removed when
+the server exits, both on a normal exit and on `SIGINT`/`SIGTERM` (Ctrl-C, or
+`docker stop`). A hard kill such as `SIGKILL` gives the server no chance to clean
+up and leaves a copy behind.
+
+Two things can go wrong once a database is locked:
+
+- **The copy cannot be written**, most often because `$TMPDIR` is full. On many
+  Linux systems `/tmp` is RAM-backed, so a large index really can fail to fit.
+  The request then fails with an error naming the cause rather than returning
+  incomplete results.
+- **The copy is taken mid-write** and comes out unusable. The server retries once
+  automatically, which almost always succeeds because the write window has
+  closed by then. If the second copy is unusable too, the error that reaches you
+  is the raw SQLite one (for example `database disk image is malformed`) rather
+  than an explanation.
 
 Earlier versions behaved differently, and in one case badly: searches over the
 Thunderbird index failed loudly with `database is locked`, while **contacts and
