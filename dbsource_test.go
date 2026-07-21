@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -165,6 +166,41 @@ var _ = Describe("dbSource under contention", func() {
 		_, err = s.Query("SELECT * FROM no_such_table")
 		Expect(err).To(HaveOccurred())
 		Expect(s.snap).To(BeNil()) // a real bug must not be masked by a copy
+	})
+
+	It("writes each snapshot generation to its own path", func() {
+		// A second copy must never be written over the file backing the first.
+		// A caller can still be iterating *sql.Rows from the previous snapshot,
+		// and truncating that inode under it yields torn pages, not just stale
+		// data. Distinct paths per generation are what make that impossible.
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		n, err := countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(3))
+		first := s.snapSub
+		Expect(first).NotTo(BeEmpty())
+
+		// Expire the TTL and invalidate the mtime memo, so the next query is
+		// forced to take a fresh copy rather than reuse the warm one.
+		s.snapAt = time.Now().Add(-2 * snapshotTTL)
+		s.srcMod = time.Time{}
+
+		n, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(3))
+
+		second := s.snapSub
+		Expect(second).NotTo(Equal(first))
+		Expect(filepath.Dir(second)).To(Equal(s.snapDir))
+		// The old generation is gone, not overwritten: nothing was written
+		// through the path the previous reader's descriptor points at.
+		_, statErr := os.Stat(filepath.Join(first, filepath.Base(f.path)))
+		Expect(os.IsNotExist(statErr)).To(BeTrue())
 	})
 
 	It("removes the snapshot directory on Close", func() {

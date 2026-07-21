@@ -32,7 +32,9 @@ type dbSource struct {
 	mu      sync.Mutex
 	live    *sql.DB
 	snap    *sql.DB   // nil until the first contention
-	snapDir string    // temp dir holding the copy; created lazily
+	snapDir string    // temp dir holding the copies; created lazily
+	snapGen int       // generation counter; each copy gets its own subdirectory
+	snapSub string    // current generation's subdirectory inside snapDir
 	snapAt  time.Time // when snap was taken
 	srcMod  time.Time // mtime of path when snap was taken
 }
@@ -107,7 +109,20 @@ func (s *dbSource) makeSnapshot(mod time.Time) error {
 		}
 		s.snapDir = dir
 	}
-	dst := filepath.Join(s.snapDir, filepath.Base(s.path))
+	// Each generation gets its own directory. Closing the previous *sql.DB
+	// above does not stop a caller still iterating *sql.Rows from an earlier
+	// snapshot: its file descriptor points at the inode we would otherwise
+	// truncate and rewrite, so that reader could observe a torn page mid-scan
+	// (SQLITE_CORRUPT, or silently wrong rows). Writing to a fresh path
+	// instead leaves the old inode untouched for as long as anyone holds it.
+	prev := s.snapSub
+	s.snapGen++
+	sub := filepath.Join(s.snapDir, fmt.Sprintf("gen%d", s.snapGen))
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		return s.snapshotErr(err)
+	}
+	s.snapSub = sub
+	dst := filepath.Join(sub, filepath.Base(s.path))
 	// The -wal is mandatory: a copy of the main file alone cannot even see the
 	// schema. The -shm is deliberately skipped - it adds nothing, and a stale
 	// copy of a volatile index into the WAL is a liability.
@@ -123,6 +138,13 @@ func (s *dbSource) makeSnapshot(mod time.Time) error {
 	db, err := sql.Open("sqlite", "file:"+dst)
 	if err != nil {
 		return s.snapshotErr(err)
+	}
+	// Only now, with the new generation in place, is the old one expendable.
+	// Removing it earlier would strand us with nothing if the copy failed.
+	// On Linux and macOS an unlink does not disturb a reader that still holds
+	// the file open, which is exactly the semantics we want here.
+	if prev != "" {
+		_ = os.RemoveAll(prev)
 	}
 	s.snap, s.snapAt, s.srcMod = db, time.Now(), mod
 	return nil
