@@ -248,8 +248,13 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 			_, err = countVia(s)
 			Expect(err).NotTo(HaveOccurred())
 		}
-		Expect(copies).To(Equal(2))         // still warm, nothing re-copied
-		Expect(s.snapAt).To(Equal(firstAt)) // and the window was not restarted
+		Expect(copies).To(Equal(2)) // still warm, nothing re-copied
+		// Do not delete: this is the ONLY assertion pinning Query's TTL gate.
+		// An untouched snapAt proves the warm snapshot was trusted outright.
+		// If the gate were removed, each call would re-probe the locked live
+		// file, fall back, and refreshSnapshot would restart the window -
+		// copies would still be 2, so that sibling assertion cannot catch it.
+		Expect(s.snapAt).To(Equal(firstAt))
 	})
 
 	It("keeps the existing copy when the TTL lapses but the source has not changed", func() {
@@ -266,12 +271,20 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 		real := s.copyFile
 		s.copyFile = func(src, dst string) error { copies++; return real(src, dst) }
 
-		s.snapAt = time.Now().Add(-2 * snapshotTTL) // force the TTL to have lapsed
+		stale := time.Now().Add(-2 * snapshotTTL)
+		s.snapAt = stale // force the TTL to have lapsed
 
 		n, err := countVia(s)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(n).To(Equal(3))
 		Expect(copies).To(Equal(0)) // mtime unchanged, so no new copy
+		// The window must be extended, not merely left lapsed. This is also the
+		// provenance check: n==3 and copies==0 are both consistent with a plain
+		// successful live read, so only an advanced snapAt proves the fallback
+		// ran and kept the existing copy. Without the extension every later call
+		// re-probes the locked live file and burns the full 5000ms busy_timeout
+		// before falling back - exactly the cost snapshotTTL exists to bound.
+		Expect(s.snapAt).To(BeTemporally(">", stale))
 	})
 
 	It("re-copies once the source has changed", func() {
@@ -291,8 +304,12 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 		s.snapAt = time.Now().Add(-2 * snapshotTTL)
 		s.srcMod = s.srcMod.Add(-time.Hour) // pretend the source moved on
 
-		_, err = countVia(s)
+		n, err := countVia(s)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(copies).To(Equal(2))
+		// A re-copy that produces a valid-but-wrong snapshot must not pass:
+		// the fresh generation still has to carry exactly the three committed
+		// rows, with the uncommitted 4th absent.
+		Expect(n).To(Equal(3))
 	})
 })
