@@ -3,6 +3,9 @@
 #
 #   curl -fsSL https://mudler.github.io/thunderbird-mcp/install.sh | sh
 #
+# Fallback URL (same script, served from the repo):
+#   curl -fsSL https://raw.githubusercontent.com/mudler/thunderbird-mcp/master/docs/install.sh | sh
+#
 # Environment:
 #   VERSION  release tag to install (e.g. v0.1.0); defaults to the latest release
 #   BINDIR   install directory; defaults to ~/.local/bin
