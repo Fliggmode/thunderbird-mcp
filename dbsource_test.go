@@ -449,6 +449,82 @@ var _ = Describe("dbSource snapshot failures", func() {
 		Expect(err.Error()).NotTo(ContainSubstring("database is locked"))
 	})
 
+	It("leaves nothing behind when the copy fails", func() {
+		// A failed attempt must reclaim the generation directory it created.
+		// This is a long-lived process: a directory abandoned here holds a
+		// partial copy of the database until exit, and under a persistently
+		// failing copy (a full $TMPDIR) one leaks per tool call, which keeps
+		// the very condition causing the failure from ever clearing.
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		// Succeed once so snapDir exists and there is a warm snapshot to keep.
+		_, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		good := s.snapSub
+		Expect(good).NotTo(BeEmpty())
+
+		s.copyFile = func(src, dst string) error {
+			return &os.PathError{Op: "write", Path: dst, Err: errors.New("no space left on device")}
+		}
+		for i := 0; i < 5; i++ {
+			s.snapAt = time.Now().Add(-2 * snapshotTTL)
+			s.srcMod = time.Time{} // force a real copy, not the unchanged-source shortcut
+			_, err = countVia(s)
+			Expect(err).To(HaveOccurred())
+		}
+
+		// Exactly one directory survives: the good one. Five failures left none.
+		entries, rerr := os.ReadDir(s.snapDir)
+		Expect(rerr).NotTo(HaveOccurred())
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		Expect(names).To(ConsistOf(filepath.Base(good)))
+	})
+
+	It("keeps serving the previous snapshot when a re-copy fails", func() {
+		// A transient copy failure must degrade to "keep serving the older
+		// copy", not discard a working snapshot and turn every later call into
+		// a hard error.
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		n, err := countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(3))
+		good, goodAt, goodMod := s.snapSub, s.snapAt, s.srcMod
+
+		s.copyFile = func(src, dst string) error {
+			return &os.PathError{Op: "write", Path: dst, Err: errors.New("no space left on device")}
+		}
+		s.snapAt = time.Now().Add(-2 * snapshotTTL)
+		s.srcMod = time.Time{}
+		_, err = countVia(s)
+		Expect(err).To(HaveOccurred())
+
+		// The working snapshot and its generation directory are untouched.
+		Expect(s.snap).NotTo(BeNil())
+		Expect(s.snapSub).To(Equal(good))
+		_, statErr := os.Stat(filepath.Join(good, filepath.Base(f.path)))
+		Expect(statErr).NotTo(HaveOccurred())
+
+		// And it still answers reads. Restore the bookkeeping the test forced
+		// stale so the warm-snapshot rung serves it, which is what a caller
+		// inside the TTL would hit.
+		s.snapAt, s.srcMod = goodAt, goodMod
+		n, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(3))
+	})
+
 	It("never lets isTorn reinterpret an error from the live file", func() {
 		// isTorn deliberately counts SQLITE_ERROR (1) as torn, because a
 		// truncated header reads as "no such table". That is only safe while it

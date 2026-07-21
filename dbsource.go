@@ -160,11 +160,15 @@ func (s *dbSource) refreshSnapshot() error {
 	return s.makeSnapshot(st)
 }
 
+// makeSnapshot builds a new generation and swaps it in only once it is fully
+// open. Nothing about the existing snapshot is touched until that succeeds, so
+// a failed refresh degrades to "keep serving the older copy" rather than
+// leaving the source with no snapshot at all. Every failure path also removes
+// the generation directory it created: this is a long-lived server process, so
+// a directory abandoned here would hold a partial copy of a database until
+// exit, and a persistent failure (a full $TMPDIR, say) would leak one per tool
+// call and keep the very condition causing it from ever clearing.
 func (s *dbSource) makeSnapshot(st srcState) error {
-	if s.snap != nil {
-		s.snap.Close()
-		s.snap = nil
-	}
 	if s.snapDir == "" {
 		dir, err := os.MkdirTemp("", "thunderbird-mcp-"+s.name+"-")
 		if err != nil {
@@ -173,24 +177,24 @@ func (s *dbSource) makeSnapshot(st srcState) error {
 		s.snapDir = dir
 	}
 	// Each generation gets its own directory. Closing the previous *sql.DB
-	// above does not stop a caller still iterating *sql.Rows from an earlier
+	// later does not stop a caller still iterating *sql.Rows from an earlier
 	// snapshot: its file descriptor points at the inode we would otherwise
 	// truncate and rewrite, so that reader could observe a torn page mid-scan
 	// (SQLITE_CORRUPT, or silently wrong rows). Writing to a fresh path
 	// instead leaves the old inode untouched for as long as anyone holds it.
-	prev := s.snapSub
+	prevSub, prevDB := s.snapSub, s.snap
 	s.snapGen++
 	sub := filepath.Join(s.snapDir, fmt.Sprintf("gen%d", s.snapGen))
 	if err := os.Mkdir(sub, 0o700); err != nil {
 		return s.snapshotErr(err)
 	}
-	s.snapSub = sub
 	dst := filepath.Join(sub, filepath.Base(s.path))
 	// The -wal is mandatory: a copy of the main file alone cannot even see the
 	// schema. The -shm is deliberately skipped - it adds nothing, and a stale
 	// copy of a volatile index into the WAL is a liability.
 	for _, suffix := range []string{"", "-wal"} {
 		if err := s.copyFile(s.path+suffix, dst+suffix); err != nil {
+			_ = os.RemoveAll(sub)
 			return s.snapshotErr(err)
 		}
 	}
@@ -200,17 +204,26 @@ func (s *dbSource) makeSnapshot(st srcState) error {
 	// throwaway, so write access costs nothing.
 	db, err := sql.Open("sqlite", "file:"+dst)
 	if err != nil {
+		_ = os.RemoveAll(sub)
 		return s.snapshotErr(err)
 	}
-	// Only now, with the new generation in place, is the old one expendable.
-	// Removing it earlier would strand us with nothing if the copy failed.
-	// On Linux and macOS an unlink does not disturb a reader that still holds
-	// the file open, which is exactly the semantics we want here.
-	if prev != "" {
-		_ = os.RemoveAll(prev)
-	}
+	// The new generation is open, so the swap happens here and cannot fail
+	// halfway. Everything above this line is either a fresh allocation or a
+	// read, which is what lets every failure path return with s.snap, s.snapAt,
+	// s.srcMod and the previous generation directory exactly as they were.
+	s.snapSub = sub
 	s.snap, s.snapAt = db, time.Now()
 	s.srcMod, s.walMod, s.walSize = st.mod, st.walMod, st.walSize
+	// Only now is the old generation expendable. On Linux and macOS an unlink
+	// does not disturb a reader that still holds the file open, which is
+	// exactly the semantics we want: an in-flight *sql.Rows from the previous
+	// snapshot keeps reading its own inode until the caller is done with it.
+	if prevDB != nil {
+		_ = prevDB.Close()
+	}
+	if prevSub != "" {
+		_ = os.RemoveAll(prevSub)
+	}
 	return nil
 }
 
@@ -279,9 +292,15 @@ func isBusy(err error) bool {
 // SQLITE_ERROR is in this set because a truncated header does not surface as a
 // corruption code at all - the file simply has no schema, so the query fails
 // with "no such table". That inclusion is only sound because isTorn is
-// consulted in exactly one place: a query against a snapshot this call just
-// made. Never apply it to an error from the live file, or a genuine schema bug
-// would be mistaken for a bad copy and silently answered from elsewhere.
+// consulted in exactly one place: a query against a snapshot, never against
+// the live file. Never move it to the live rung, or a genuine schema bug would
+// be mistaken for a bad copy and silently answered from a stale copy instead.
+//
+// The snapshot in question is not always freshly copied: refreshSnapshot's
+// unchanged-source shortcut hands back an older generation. What is
+// guaranteed is only that misjudging such an error cannot hide it: the single
+// retry re-copies and then returns that query's error unconditionally, so a
+// real schema problem still reaches the caller, one extra copy later.
 func isTorn(err error) bool {
 	return sqliteCodeIn(err,
 		11, // SQLITE_CORRUPT
