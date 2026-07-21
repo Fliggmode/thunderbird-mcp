@@ -189,19 +189,31 @@ func (s *dbSource) makeSnapshot(st srcState) error {
 		return s.snapshotErr(err)
 	}
 	dst := filepath.Join(sub, filepath.Base(s.path))
-	// The -wal is mandatory: a copy of the main file alone cannot even see the
-	// schema. The -shm is deliberately skipped - it adds nothing, and a stale
-	// copy of a volatile index into the WAL is a liability.
-	for _, suffix := range []string{"", "-wal"} {
+	// A database is in exactly one journal mode, so exactly one sidecar exists
+	// and the other copy is a no-op (copyFile treats a missing source as one).
+	// Both are mandatory for their mode: in WAL mode a copy of the main file
+	// alone cannot even see the schema, and in rollback-journal mode a hot
+	// -journal is the only record of the pages needed to undo a half-written
+	// transaction - dropping it yields a file that opens cleanly and reports
+	// rows that were never committed. Rollback mode is not hypothetical:
+	// SQLite cannot use WAL on a network filesystem, so a profile on
+	// NFS/CIFS/SMB runs in rollback-journal mode, and key4.db uses it always.
+	// The -shm is deliberately skipped - it exists only in WAL mode, it adds
+	// nothing, and a stale copy of a volatile index into the WAL is a liability.
+	for _, suffix := range []string{"", "-wal", "-journal"} {
 		if err := s.copyFile(s.path+suffix, dst+suffix); err != nil {
 			_ = os.RemoveAll(sub)
 			return s.snapshotErr(err)
 		}
 	}
 	// Read-write, not mode=ro: the copy was taken while Thunderbird may have
-	// been mid-transaction, so its WAL can need recovery, and only a
-	// read-write connection can run recovery. The copy is a private
-	// throwaway, so write access costs nothing.
+	// been mid-transaction, so it can need recovery - replaying committed
+	// frames out of a -wal, or rolling the main file back from a hot -journal -
+	// and only a read-write connection can run either. mode=ro fails outright
+	// on a hot journal ("attempt to write a readonly database"), and
+	// immutable=1 papers over it by skipping recovery entirely, which returns
+	// pre-commit bytes with no error at all. The copy is a private throwaway,
+	// so write access costs nothing.
 	db, err := sql.Open("sqlite", "file:"+dst)
 	if err != nil {
 		_ = os.RemoveAll(sub)

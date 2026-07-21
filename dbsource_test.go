@@ -242,14 +242,14 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 
 		_, err = countVia(s)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(copies).To(Equal(2)) // main + -wal, one copy each
+		Expect(copies).To(Equal(3)) // main + -wal + -journal, one copy attempt each
 
 		firstAt := s.snapAt
 		for i := 0; i < 5; i++ {
 			_, err = countVia(s)
 			Expect(err).NotTo(HaveOccurred())
 		}
-		Expect(copies).To(Equal(2)) // still warm, nothing re-copied
+		Expect(copies).To(Equal(3)) // still warm, nothing re-copied
 		// Do not delete: this is the ONLY assertion pinning Query's TTL gate.
 		// An untouched snapAt proves the warm snapshot was trusted outright.
 		// If the gate were removed, each call would re-probe the locked live
@@ -342,7 +342,7 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 
 		n, err := countVia(s)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(copies).To(Equal(2)) // main + -wal: the WAL growth forced a fresh copy
+		Expect(copies).To(Equal(3)) // main + -wal + -journal: the WAL growth forced a fresh copy
 		Expect(n).To(Equal(3))      // and the fresh copy is still correct
 	})
 
@@ -365,7 +365,7 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 
 		n, err := countVia(s)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(copies).To(Equal(2))
+		Expect(copies).To(Equal(3))
 		// A re-copy that produces a valid-but-wrong snapshot must not pass:
 		// the fresh generation still has to carry exactly the three committed
 		// rows, with the uncommitted 4th absent.
@@ -395,7 +395,7 @@ var _ = Describe("dbSource snapshot failures", func() {
 		real := s.copyFile
 		s.copyFile = func(src, dst string) error {
 			attempts++
-			if attempts <= 2 { // the main file and its -wal, first pass
+			if attempts <= 3 { // the main file and both sidecar names, first pass
 				return os.WriteFile(dst, []byte("torn garbage"), 0o600)
 			}
 			return real(src, dst)
@@ -404,7 +404,7 @@ var _ = Describe("dbSource snapshot failures", func() {
 		n, err := countVia(s)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(n).To(Equal(3))
-		Expect(attempts).To(Equal(4)) // one torn pass, one good pass
+		Expect(attempts).To(Equal(6)) // one torn pass, one good pass
 		// The retry must land on a fresh generation rather than rewrite the
 		// torn one in place - the same inode-safety rule as any other re-copy.
 		Expect(s.snapGen).To(Equal(2))
@@ -427,7 +427,7 @@ var _ = Describe("dbSource snapshot failures", func() {
 
 		_, err = countVia(s)
 		Expect(err).To(HaveOccurred())
-		Expect(attempts).To(Equal(4)) // two passes of main + -wal, then stop
+		Expect(attempts).To(Equal(6)) // two passes of main + both sidecar names, then stop
 	})
 
 	It("gives an actionable error when the snapshot cannot be written", func() {
@@ -645,5 +645,93 @@ var _ = Describe("profile sources under a locked profile", func() {
 		evs, err := cal.Events(time.UnixMicro(0), time.Now().AddDate(100, 0, 0), 50)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(evs).NotTo(BeEmpty())
+	})
+})
+
+// newHotJournalFixture builds a rollback-journal database left exactly as a
+// crash (or a mid-transaction Thunderbird) leaves one: the main file holds
+// partially-written pages and the -journal holds the originals needed to undo
+// them. Rollback mode is what a profile on a network filesystem runs in, since
+// SQLite cannot use WAL there, and it is what key4.db uses unconditionally.
+//
+// The tiny cache_size is load-bearing: it forces the open transaction's dirty
+// pages to spill into the main file before the COMMIT that would make them
+// legitimate, which is what creates the hot journal and the divergence. It also
+// makes the writer take an EXCLUSIVE lock, so the live read hits BUSY and the
+// snapshot path is what answers.
+//
+// The writing connection stays OPEN on purpose: closing it would roll the
+// transaction back and heal the database, and the test would prove nothing.
+func newHotJournalFixture(dir string, rows int) (string, func()) {
+	ctx := context.Background()
+	path := filepath.Join(dir, "rollback.sqlite")
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	Expect(err).NotTo(HaveOccurred())
+	db.SetMaxOpenConns(1)
+
+	var jm string
+	Expect(db.QueryRow("PRAGMA journal_mode=DELETE").Scan(&jm)).To(Succeed())
+	Expect(jm).To(Equal("delete"))
+	_, err = db.Exec("PRAGMA cache_size=10")
+	Expect(err).NotTo(HaveOccurred())
+
+	_, err = db.Exec("CREATE TABLE t(x TEXT)")
+	Expect(err).NotTo(HaveOccurred())
+	seed, err := db.Begin()
+	Expect(err).NotTo(HaveOccurred())
+	for i := 0; i < rows; i++ {
+		_, err = seed.Exec("INSERT INTO t VALUES('committed')")
+		Expect(err).NotTo(HaveOccurred())
+	}
+	Expect(seed.Commit()).To(Succeed())
+
+	conn, err := db.Conn(ctx)
+	Expect(err).NotTo(HaveOccurred())
+	tx, err := conn.BeginTx(ctx, nil)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = tx.ExecContext(ctx, "UPDATE t SET x='uncommitted'")
+	Expect(err).NotTo(HaveOccurred())
+
+	// Guard the premise: without a hot journal on disk there is nothing to
+	// recover and the test degenerates into a plain copy check.
+	_, err = os.Stat(path + "-journal")
+	Expect(err).NotTo(HaveOccurred(), "fixture must leave a hot -journal on disk")
+
+	return path, func() {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		_ = db.Close()
+	}
+}
+
+var _ = Describe("dbSource against a rollback-journal database", func() {
+	It("recovers a hot journal in the snapshot and serves the committed rows", func() {
+		// Copying the main file without its -journal yields a database that
+		// opens cleanly, reports no error, and answers with the half-written
+		// page image: fewer rows than were ever committed, silently. The
+		// -journal is what lets the snapshot's read-write connection roll the
+		// main file back to its last committed state.
+		const rows = 3000
+		path, release := newHotJournalFixture(GinkgoT().TempDir(), rows)
+		defer release()
+
+		s, err := openDBSource(path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		n, err := countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(rows))
+		Expect(s.snap).NotTo(BeNil()) // the snapshot rung is what answered
+
+		// And the values are the committed ones, not the uncommitted UPDATE.
+		vrows, err := s.Query("SELECT count(*) FROM t WHERE x = 'committed'")
+		Expect(err).NotTo(HaveOccurred())
+		defer vrows.Close()
+		Expect(vrows.Next()).To(BeTrue())
+		var committed int
+		Expect(vrows.Scan(&committed)).To(Succeed())
+		Expect(committed).To(Equal(rows))
 	})
 })
