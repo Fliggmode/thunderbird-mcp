@@ -26,6 +26,8 @@ It works with any MCP client and is designed to pair with [LocalAI](https://loca
 
 It is a single, static, **CGO-free** Go binary.
 
+**Expected latency while Thunderbird holds a lock.** SQLite databases are normally read live, even with Thunderbird running. When Thunderbird does hold an exclusive lock, the first affected request waits about 5 seconds for it, then falls back to copying the database to a private snapshot, so a large search index is not instant. Subsequent requests are served from that snapshot and are fast for the next 60 seconds. Startup can pay the same wait once per data source. This is expected behaviour, not a hang.
+
 ## Tools
 
 Three domain tools, each driven by an `action` enum:
