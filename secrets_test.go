@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/des"
@@ -233,3 +234,79 @@ func writeNSSFixture(dir, masterPassword string) {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(os.WriteFile(filepath.Join(dir, "logins.json"), data, 0o600)).To(Succeed())
 }
+
+// hotJournalKey4 leaves dir's key4.db in the state a crash or a mid-transaction
+// NSS leaves it: rollback-journal mode (which is what key4.db always uses - its
+// header bytes 18/19 are 1/1, not 2/2), a hot -journal on disk, and a main file
+// whose metaData page has already been overwritten by an UPDATE that was never
+// committed. The tiny cache_size forces that spill; the writer takes an
+// EXCLUSIVE lock to perform it, so a live read hits BUSY.
+//
+// The writing connection stays OPEN. Closing it would roll the transaction back
+// and heal the file, and every assertion built on this would be vacuous.
+func hotJournalKey4(dir string) func() {
+	writeNSSFixture(dir, "")
+	path := filepath.Join(dir, "key4.db")
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	Expect(err).NotTo(HaveOccurred())
+	db.SetMaxOpenConns(1)
+
+	var jm string
+	Expect(db.QueryRow("PRAGMA journal_mode=DELETE").Scan(&jm)).To(Succeed())
+	Expect(jm).To(Equal("delete"))
+	_, err = db.Exec("PRAGMA cache_size=10")
+	Expect(err).NotTo(HaveOccurred())
+
+	_, err = db.Exec("CREATE TABLE filler(x TEXT)")
+	Expect(err).NotTo(HaveOccurred())
+	seed, err := db.Begin()
+	Expect(err).NotTo(HaveOccurred())
+	for i := 0; i < 3000; i++ {
+		_, err = seed.Exec("INSERT INTO filler VALUES('committed')")
+		Expect(err).NotTo(HaveOccurred())
+	}
+	Expect(seed.Commit()).To(Succeed())
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	Expect(err).NotTo(HaveOccurred())
+	tx, err := conn.BeginTx(ctx, nil)
+	Expect(err).NotTo(HaveOccurred())
+	// Destroy the credential material in the uncommitted image, so a reader
+	// that skips recovery cannot possibly return the right password by luck.
+	_, err = tx.ExecContext(ctx, `UPDATE metaData SET item1 = x'00', item2 = x'00'`)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = tx.ExecContext(ctx, `UPDATE nssPrivate SET a11 = x'00'`)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = tx.ExecContext(ctx, `UPDATE filler SET x = 'uncommitted'`)
+	Expect(err).NotTo(HaveOccurred())
+
+	_, err = os.Stat(path + "-journal")
+	Expect(err).NotTo(HaveOccurred(), "fixture must leave a hot -journal on disk")
+
+	return func() {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		_ = db.Close()
+	}
+}
+
+var _ = Describe("LoadCredentials against a key4.db with a hot rollback journal", func() {
+	It("rolls the journal back and decrypts the committed credentials", func() {
+		// immutable=1 - what recoverMasterKey used to open key4.db with - tells
+		// SQLite there is no journal to worry about, so it reads the spilled,
+		// never-committed page image and returns wrong bytes with no error at
+		// all. Going through dbSource instead means the snapshot's read-write
+		// connection runs the rollback and the committed row is what is read.
+		dir := GinkgoT().TempDir()
+		release := hotJournalKey4(dir)
+		defer release()
+
+		creds, err := LoadCredentials(dir)
+		Expect(err).NotTo(HaveOccurred())
+		pw, ok := creds.Lookup("imap.example.com", "alice@example.com")
+		Expect(ok).To(BeTrue())
+		Expect(pw).To(Equal("s3cret-imap"))
+	})
+})

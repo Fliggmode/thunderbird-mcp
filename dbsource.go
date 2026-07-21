@@ -132,6 +132,28 @@ func (s *dbSource) Query(q string, args ...any) (*sql.Rows, error) {
 	return s.snap.Query(q, args...)
 }
 
+// queryOne is Query plus the sql.Row shape: it scans the first row into dest
+// and reports sql.ErrNoRows when there is none, so callers that want a single
+// row do not each have to spell out the Next/Scan/Err dance. Deliberately not
+// returning a *sql.Row: that type can only be built by database/sql itself.
+func (s *dbSource) queryOne(q string, dest ...any) error {
+	rows, err := s.Query(q)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	if err := rows.Scan(dest...); err != nil {
+		return err
+	}
+	return rows.Err()
+}
+
 // makeSnapshotNow forces a fresh copy, bypassing the mtime shortcut in
 // refreshSnapshot. That shortcut would be actively wrong here: the source
 // mtime is unchanged since the torn copy, so it would hand back the very

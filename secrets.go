@@ -8,7 +8,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
@@ -19,7 +18,6 @@ import (
 	"path/filepath"
 
 	"golang.org/x/crypto/pbkdf2"
-	_ "modernc.org/sqlite"
 )
 
 var ErrMasterPassword = errors.New("thunderbird profile is protected by a master password; credential decryption is not supported")
@@ -175,14 +173,21 @@ func legacy3DESKeyIV(globalSalt, entrySalt []byte) (key, iv []byte) {
 // recoverMasterKey reads key4.db, verifies password-check, and returns the 24-byte
 // 3DES master key from nssPrivate.a11.
 func recoverMasterKey(key4Path string) ([]byte, error) {
-	db, err := sql.Open("sqlite", "file:"+key4Path+"?mode=ro&immutable=1")
+	// Through dbSource, not a bare immutable=1 connection. key4.db is a
+	// rollback-journal database, and immutable=1 tells SQLite to skip recovery
+	// entirely: against a hot journal it hands back pre-commit page images with
+	// no error at all, which for a credential store means silently wrong key
+	// material rather than a clean failure. dbSource reads the live file, falls
+	// back to a private snapshot when NSS holds a lock, and lets that snapshot's
+	// read-write connection actually run the rollback.
+	db, err := openDBSource(key4Path, "key4")
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 
 	var globalSalt, item2 []byte
-	err = db.QueryRow(`SELECT item1, item2 FROM metaData WHERE id = 'password'`).Scan(&globalSalt, &item2)
+	err = db.queryOne(`SELECT item1, item2 FROM metaData WHERE id = 'password'`, &globalSalt, &item2)
 	if err != nil {
 		return nil, fmt.Errorf("reading metaData: %w", err)
 	}
@@ -195,7 +200,7 @@ func recoverMasterKey(key4Path string) ([]byte, error) {
 	}
 
 	var a11 []byte
-	if err := db.QueryRow(`SELECT a11 FROM nssPrivate WHERE a11 IS NOT NULL LIMIT 1`).Scan(&a11); err != nil {
+	if err := db.queryOne(`SELECT a11 FROM nssPrivate WHERE a11 IS NOT NULL LIMIT 1`, &a11); err != nil {
 		return nil, fmt.Errorf("reading nssPrivate: %w", err)
 	}
 	dec, err := decryptPBEItem(globalSalt, a11)
