@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -321,5 +322,101 @@ var _ = Describe("dbSource snapshot refresh policy", func() {
 		// the fresh generation still has to carry exactly the three committed
 		// rows, with the uncommitted 4th absent.
 		Expect(n).To(Equal(3))
+	})
+})
+
+var _ = Describe("dbSource snapshot failures", func() {
+	var dir string
+	var f *walFixture
+	BeforeEach(func() {
+		dir = GinkgoT().TempDir()
+		f = newWALFixture(dir)
+	})
+	AfterEach(func() { f.close() })
+
+	It("re-copies once when the first snapshot came out torn", func() {
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		// Simulate a copy taken mid-write: the first attempt writes garbage,
+		// every later attempt copies for real.
+		var attempts int
+		real := s.copyFile
+		s.copyFile = func(src, dst string) error {
+			attempts++
+			if attempts <= 2 { // the main file and its -wal, first pass
+				return os.WriteFile(dst, []byte("torn garbage"), 0o600)
+			}
+			return real(src, dst)
+		}
+
+		n, err := countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(3))
+		Expect(attempts).To(Equal(4)) // one torn pass, one good pass
+		// The retry must land on a fresh generation rather than rewrite the
+		// torn one in place - the same inode-safety rule as any other re-copy.
+		Expect(s.snapGen).To(Equal(2))
+	})
+
+	It("gives up when the second copy is torn too", func() {
+		// The retry is once, not a loop: a permanently unreadable copy has to
+		// surface as an error instead of spinning.
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		var attempts int
+		s.copyFile = func(src, dst string) error {
+			attempts++
+			return os.WriteFile(dst, []byte("torn garbage"), 0o600)
+		}
+
+		_, err = countVia(s)
+		Expect(err).To(HaveOccurred())
+		Expect(attempts).To(Equal(4)) // two passes of main + -wal, then stop
+	})
+
+	It("gives an actionable error when the snapshot cannot be written", func() {
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		s.copyFile = func(src, dst string) error {
+			return &os.PathError{Op: "write", Path: dst, Err: errors.New("no space left on device")}
+		}
+
+		_, err = countVia(s)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Thunderbird is holding"))
+		Expect(err.Error()).To(ContainSubstring("no space left on device"))
+		Expect(err.Error()).To(ContainSubstring("close Thunderbird"))
+		Expect(err.Error()).NotTo(ContainSubstring("database is locked"))
+	})
+
+	It("never lets isTorn reinterpret an error from the live file", func() {
+		// isTorn deliberately counts SQLITE_ERROR (1) as torn, because a
+		// truncated header reads as "no such table". That is only safe while it
+		// is consulted for a query against a freshly made snapshot. If it ever
+		// reached the live rung, a genuine schema error would be swallowed and
+		// answered from a copy instead of reported.
+		s, err := openDBSource(f.path, "fixture") // unlocked: the live rung answers
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		_, err = s.Query("SELECT * FROM no_such_table")
+		Expect(err).To(HaveOccurred())
+		Expect(isTorn(err)).To(BeTrue()) // the classifier would say "torn"...
+		Expect(err.Error()).To(ContainSubstring("no such table"))
+		Expect(s.snap).To(BeNil())                                            // ...yet no copy was taken,
+		Expect(s.snapGen).To(Equal(0))                                        // no generation was burned,
+		Expect(err.Error()).NotTo(ContainSubstring("Thunderbird is holding")) // and the caller got the real error
 	})
 })

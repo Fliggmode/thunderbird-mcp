@@ -80,7 +80,31 @@ func (s *dbSource) Query(q string, args ...any) (*sql.Rows, error) {
 	if err := s.refreshSnapshot(); err != nil {
 		return nil, err
 	}
+	rows, err = s.snap.Query(q, args...)
+	if err == nil || !isTorn(err) {
+		return rows, err
+	}
+	// 4. The copy was taken mid-write and is unusable. Take it again - the
+	// window that produced it has almost certainly closed. Retry exactly once:
+	// a second torn copy is not a race, and its error is the honest answer.
+	if err := s.makeSnapshotNow(); err != nil {
+		return nil, err
+	}
 	return s.snap.Query(q, args...)
+}
+
+// makeSnapshotNow forces a fresh copy, bypassing the mtime shortcut in
+// refreshSnapshot. That shortcut would be actively wrong here: the source
+// mtime is unchanged since the torn copy, so it would hand back the very
+// snapshot we just rejected.
+func (s *dbSource) makeSnapshotNow() error {
+	st, err := os.Stat(s.path)
+	if err != nil {
+		return s.snapshotErr(err)
+	}
+	// makeSnapshot allocates the next generation directory, so the retry
+	// writes to a path of its own and never rewrites the torn file in place.
+	return s.makeSnapshot(st.ModTime())
 }
 
 // refreshSnapshot ensures s.snap is usable, re-copying only when the source
@@ -207,6 +231,23 @@ func (s *dbSource) Close() error {
 // signal, the only condition that justifies falling back to a snapshot.
 func isBusy(err error) bool {
 	return sqliteCodeIn(err, 5 /* SQLITE_BUSY */, 6 /* SQLITE_LOCKED */)
+}
+
+// isTorn reports whether err indicates the snapshot was copied while
+// Thunderbird was mid-write, leaving an unusable file.
+//
+// SQLITE_ERROR is in this set because a truncated header does not surface as a
+// corruption code at all - the file simply has no schema, so the query fails
+// with "no such table". That inclusion is only sound because isTorn is
+// consulted in exactly one place: a query against a snapshot this call just
+// made. Never apply it to an error from the live file, or a genuine schema bug
+// would be mistaken for a bad copy and silently answered from elsewhere.
+func isTorn(err error) bool {
+	return sqliteCodeIn(err,
+		11, // SQLITE_CORRUPT
+		26, // SQLITE_NOTADB
+		1,  // SQLITE_ERROR - a torn header reads as "no such table"
+	)
 }
 
 // sqliteCodeIn matches against primary result codes; extended codes are
