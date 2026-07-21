@@ -117,3 +117,68 @@ var _ = Describe("dbSource", func() {
 		Expect(s.Close()).To(Succeed())
 	})
 })
+
+var _ = Describe("dbSource under contention", func() {
+	var dir string
+	var f *walFixture
+	BeforeEach(func() {
+		dir = GinkgoT().TempDir()
+		f = newWALFixture(dir)
+	})
+	AfterEach(func() { f.close() })
+
+	It("falls back to a snapshot when the live file is locked", func() {
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		n, err := countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		// 3 proves two things at once: the read survived the lock, and the
+		// copy included the -wal (all three rows live there un-checkpointed).
+		// The uncommitted 4th row must not appear.
+		Expect(n).To(Equal(3))
+		Expect(s.snap).NotTo(BeNil())
+	})
+
+	It("cannot read the locked file live", func() {
+		f.lock()
+
+		// Guards the premise of the test above: if this ever stops returning
+		// BUSY, the fallback spec would pass without exercising the fallback.
+		live, err := sql.Open("sqlite", "file:"+f.path+"?mode=ro&_pragma=busy_timeout(200)")
+		Expect(err).NotTo(HaveOccurred())
+		defer live.Close()
+		var n int
+		err = live.QueryRow("SELECT count(*) FROM t").Scan(&n)
+		Expect(err).To(HaveOccurred())
+		Expect(isBusy(err)).To(BeTrue())
+	})
+
+	It("does not snapshot when the query itself is bad", func() {
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		_, err = s.Query("SELECT * FROM no_such_table")
+		Expect(err).To(HaveOccurred())
+		Expect(s.snap).To(BeNil()) // a real bug must not be masked by a copy
+	})
+
+	It("removes the snapshot directory on Close", func() {
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+
+		snapDir := s.snapDir
+		Expect(snapDir).NotTo(BeEmpty())
+		Expect(s.Close()).To(Succeed())
+		_, statErr := os.Stat(snapDir)
+		Expect(os.IsNotExist(statErr)).To(BeTrue())
+	})
+})
