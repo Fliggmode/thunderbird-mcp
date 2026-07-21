@@ -18,10 +18,30 @@ open a profile file:
 Gloda is the only one that respects locking, which is why it is the one that
 failed. The other two are not correct — they are silently unsafe.
 `immutable=1` tells SQLite the file never changes, so it **ignores the `-wal`
-file entirely**: if the database is in WAL mode, those reads return a stale
-pre-checkpoint snapshot with no error. The visible bug and this latent one have
-the same root cause: there is no single, deliberate answer to "how do we read a
-live profile".
+file entirely**. On a WAL-mode database that is not merely stale: everything
+written since the last checkpoint is invisible, including the schema itself.
+The visible bug and this latent one have the same root cause: there is no
+single, deliberate answer to "how do we read a live profile".
+
+### Measured behavior
+
+Verified against `modernc.org/sqlite v1.54.0` with a WAL database held by a live
+writer (probe run 2026-07-21, then discarded):
+
+| Read | Result |
+|---|---|
+| `mode=ro`, writer active but no exclusive lock | works — WAL readers coexist fine |
+| `mode=ro`, writer holds `locking_mode=EXCLUSIVE` txn | **`SQLITE_BUSY` (code 5)** — the reported bug |
+| `immutable=1`, same exclusive lock | no error, but `no such table` |
+| snapshot of main file **only** | `no such table` — the `-wal` holds everything |
+| snapshot of main + `-wal`, opened rw | all rows |
+| snapshot of main + `-wal`, opened `mode=ro` | all rows |
+| snapshot of main + `-wal` + `-shm` | all rows — `-shm` adds nothing |
+| snapshot, `immutable=1` | `no such table` |
+
+Two consequences for the design: copying the `-wal` is **mandatory** and copying
+the `-shm` is unnecessary; and contention is rare rather than constant, so the
+live path will serve the large majority of reads.
 
 A second-order issue: `LoadApp` opens all three databases once at startup and
 holds the handles for the process lifetime (`main.go:47`, `app.go:48-62`).
@@ -80,15 +100,17 @@ nearly every tool call.
 
 ### Snapshotting
 
-Copy `X.sqlite`, plus `X.sqlite-wal` and `X.sqlite-shm` when present, into a
-per-process directory from `os.MkdirTemp`, removed on `Close`.
+Copy `X.sqlite` **and `X.sqlite-wal`** into a per-process directory from
+`os.MkdirTemp`, removed on `Close`. The `-wal` is not optional: a snapshot of
+the main file alone cannot even see the schema (measured above). The `-shm` is
+deliberately **not** copied — it adds nothing, and a stale copy of a volatile
+index into the WAL is a liability rather than a help.
 
-The copy is opened **read-write** (plain `file:<tmp>`), not `mode=ro`. This is
-the point the whole design rests on: a read-only connection cannot run WAL
-recovery, so it would ignore the copied `-wal` and serve exactly the stale
-pre-checkpoint data that `immutable=1` serves today. Because the copy is our
-private throwaway, SQLite replays the WAL and we see Thunderbird's
-un-checkpointed writes.
+The copy is opened **read-write** (plain `file:<tmp>`). A `mode=ro` snapshot
+also reads the WAL correctly, so this is not about visibility; it is about
+recovery. We copy while Thunderbird may be mid-transaction, so the copied WAL
+can need recovery, and only a read-write connection can run it. The copy is our
+private throwaway, so granting write access costs nothing.
 
 The copy is not atomic and can therefore be torn. WAL replay heals the common
 case. If a query against a freshly made snapshot fails with *malformed* or *not
@@ -144,8 +166,9 @@ every result set in memory.
 ## Rejected alternatives
 
 - **`nolock=1` direct reads.** Free and zero-disk, but WAL readers need write
-  access to the `-shm`, so `nolock` either fails or silently serves a stale
-  pre-checkpoint snapshot — the same class of bug as the current `immutable=1`.
+  access to the `-shm`, so `nolock` either fails or hides everything written
+  since the last checkpoint — the same class of bug as the current
+  `immutable=1`, which was measured doing exactly that.
 - **Always snapshot.** Simpler (one code path) but pays a full copy even when
   Thunderbird is closed, which is the case where everything already works.
 - **Bypass the databases via IMAP/mbox.** `imap.go` and `mbox.go` already exist
