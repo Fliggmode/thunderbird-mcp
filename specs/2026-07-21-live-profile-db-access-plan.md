@@ -14,7 +14,7 @@
 
 - Snapshots copy the main file **and `-wal`**. A snapshot of the main file alone cannot see the schema. Do **not** copy `-shm`.
 - Snapshot connections are opened **read-write** (plain `file:<path>`, no `mode=ro`), because a copied WAL may need recovery and only a read-write connection can run it.
-- `immutable=1` must not appear in any DSN after Task 5. On a WAL database it hides everything since the last checkpoint, including the schema.
+- `immutable=1` must not appear in the gloda, contacts or calendar DSNs after Task 5. On a WAL database it hides everything since the last checkpoint, including the schema. `secrets.go` (key4.db) is deliberately out of scope: it is the NSS credential store, read once at startup, and its failures are already non-fatal. Tracked as a follow-up, not part of this plan.
 - Live reads use exactly `file:<path>?mode=ro&_pragma=busy_timeout(5000)`.
 - `snapshotTTL` is a package constant of `60 * time.Second`. Not configurable.
 - Only `SQLITE_BUSY` (5) and `SQLITE_LOCKED` (6) trigger the snapshot fallback. Compare with `se.Code() & 0xff` so extended result codes match.
