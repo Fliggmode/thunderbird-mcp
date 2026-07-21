@@ -218,3 +218,81 @@ var _ = Describe("dbSource under contention", func() {
 		Expect(os.IsNotExist(statErr)).To(BeTrue())
 	})
 })
+
+var _ = Describe("dbSource snapshot refresh policy", func() {
+	var dir string
+	var f *walFixture
+	BeforeEach(func() {
+		dir = GinkgoT().TempDir()
+		f = newWALFixture(dir)
+	})
+	AfterEach(func() { f.close() })
+
+	It("reuses a warm snapshot without copying again", func() {
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		var copies int
+		real := s.copyFile
+		s.copyFile = func(src, dst string) error { copies++; return real(src, dst) }
+
+		_, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(copies).To(Equal(2)) // main + -wal, one copy each
+
+		firstAt := s.snapAt
+		for i := 0; i < 5; i++ {
+			_, err = countVia(s)
+			Expect(err).NotTo(HaveOccurred())
+		}
+		Expect(copies).To(Equal(2))         // still warm, nothing re-copied
+		Expect(s.snapAt).To(Equal(firstAt)) // and the window was not restarted
+	})
+
+	It("keeps the existing copy when the TTL lapses but the source has not changed", func() {
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		_, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+
+		var copies int
+		real := s.copyFile
+		s.copyFile = func(src, dst string) error { copies++; return real(src, dst) }
+
+		s.snapAt = time.Now().Add(-2 * snapshotTTL) // force the TTL to have lapsed
+
+		n, err := countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(3))
+		Expect(copies).To(Equal(0)) // mtime unchanged, so no new copy
+	})
+
+	It("re-copies once the source has changed", func() {
+		f.lock()
+
+		s, err := openDBSource(f.path, "fixture")
+		Expect(err).NotTo(HaveOccurred())
+		defer s.Close()
+
+		_, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+
+		var copies int
+		real := s.copyFile
+		s.copyFile = func(src, dst string) error { copies++; return real(src, dst) }
+
+		s.snapAt = time.Now().Add(-2 * snapshotTTL)
+		s.srcMod = s.srcMod.Add(-time.Hour) // pretend the source moved on
+
+		_, err = countVia(s)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(copies).To(Equal(2))
+	})
+})
