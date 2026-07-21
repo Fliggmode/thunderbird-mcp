@@ -55,6 +55,38 @@ var _ = Describe("Mutate handlers reject local folders", func() {
 
 func ptr[T any](v T) *T { return &v }
 
+var _ = Describe("Mail handlers on a profile with no gloda index", func() {
+	// OpenGloda returns (nil, nil) when global-messages-db.sqlite is absent, so
+	// app.Gloda is legitimately nil on such a profile. The go-sdk dispatches
+	// handlers on a spawned goroutine, where a panic takes the whole process
+	// down without running the deferred App.Close() - which is what removes the
+	// snapshot directories. These must return an error, never panic.
+	BeforeEach(func() {
+		app = &App{Config: &Config{}}
+		Expect(app.Gloda).To(BeNil())
+	})
+
+	It("search_messages errors instead of panicking", func() {
+		var out SearchMessagesOutput
+		var err error
+		Expect(func() {
+			_, out, err = SearchMessages(context.Background(), nil, SearchMessagesInput{Query: "anything"})
+		}).NotTo(Panic())
+		Expect(err).To(HaveOccurred())
+		Expect(out.Count).To(BeZero())
+	})
+
+	It("list_recent errors instead of panicking", func() {
+		var out ListRecentOutput
+		var err error
+		Expect(func() {
+			_, out, err = ListRecent(context.Background(), nil, ListRecentInput{})
+		}).NotTo(Panic())
+		Expect(err).To(HaveOccurred())
+		Expect(out.Count).To(BeZero())
+	})
+})
+
 var _ = Describe("Contacts and calendar handlers", func() {
 	BeforeEach(func() {
 		app = &App{Config: &Config{Calendars: []CalendarRef{{UUID: "cal-uuid-1", Name: "Home", Type: "storage"}}}}

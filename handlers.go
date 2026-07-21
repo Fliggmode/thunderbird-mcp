@@ -163,6 +163,9 @@ func ListAccounts(_ context.Context, _ *mcp.CallToolRequest, _ ListAccountsInput
 }
 
 func SearchMessages(_ context.Context, _ *mcp.CallToolRequest, in SearchMessagesInput) (*mcp.CallToolResult, SearchMessagesOutput, error) {
+	if app.Gloda == nil {
+		return nil, SearchMessagesOutput{}, fmt.Errorf("no search index available")
+	}
 	since, err := parseDate(in.Since)
 	if err != nil {
 		return nil, SearchMessagesOutput{}, fmt.Errorf("invalid since: %w", err)
@@ -218,6 +221,9 @@ func GetMessage(_ context.Context, _ *mcp.CallToolRequest, in GetMessageInput) (
 }
 
 func ListRecent(_ context.Context, _ *mcp.CallToolRequest, in ListRecentInput) (*mcp.CallToolResult, ListRecentOutput, error) {
+	if app.Gloda == nil {
+		return nil, ListRecentOutput{}, fmt.Errorf("no search index available")
+	}
 	limit := in.Limit
 	if limit <= 0 {
 		limit = 20
