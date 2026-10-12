@@ -13,11 +13,12 @@ type App struct {
 	ReadOnly  bool
 	AllowSend bool
 
-	Gloda    *Gloda
-	Contacts *Contacts
-	Calendar *Calendar
-	IMAP     *IMAP
-	Sender   *Sender
+	Gloda       *Gloda
+	Contacts    *Contacts
+	Calendar    *Calendar
+	calendarErr error // retain startup storage failures for list_events
+	IMAP        *IMAP
+	Sender      *Sender
 }
 
 // app is the process-wide server state, populated in main().
@@ -58,6 +59,7 @@ func loadAppFromConfig(cfg *Config, creds *Credentials, readOnly, allowSend bool
 	}
 	if c, err := OpenCalendar(cfg.ProfileDir, cfg.Calendars); err != nil {
 		log.Printf("thunderbird: calendar unavailable: %v", err)
+		a.calendarErr = err
 	} else {
 		a.Calendar = c
 	}

@@ -540,6 +540,9 @@ func ListCalendars(_ context.Context, _ *mcp.CallToolRequest, _ ListCalendarsInp
 }
 
 func ListEvents(_ context.Context, _ *mcp.CallToolRequest, in ListEventsInput) (*mcp.CallToolResult, ListEventsOutput, error) {
+	if app.calendarErr != nil {
+		return nil, ListEventsOutput{}, app.calendarErr
+	}
 	if app.Calendar == nil {
 		return nil, ListEventsOutput{}, fmt.Errorf("no calendar available")
 	}
