@@ -640,9 +640,8 @@ var _ = Describe("profile sources under a locked profile", func() {
 		Expect(err).NotTo(HaveOccurred())
 		defer cal.Close()
 
-		// Widest possible window, so this asserts "reads succeed under a lock"
-		// rather than re-testing the date filtering calendar_test.go covers.
-		evs, err := cal.Events(time.UnixMicro(0), time.Now().AddDate(100, 0, 0), 50)
+		// A bounded window around the synthetic fixture asserts reads under a lock.
+		evs, err := cal.Events(time.Unix(1699000000, 0), time.Unix(1701000000, 0), 50)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(evs).NotTo(BeEmpty())
 	})

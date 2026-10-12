@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -96,18 +97,25 @@ func openDBSource(path, name string) (*dbSource, error) {
 }
 
 func (s *dbSource) Query(q string, args ...any) (*sql.Rows, error) {
+	return s.QueryContext(context.Background(), q, args...)
+}
+
+func (s *dbSource) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// 1. A warm snapshot wins outright: contention is sticky for the TTL, so
 	// we do not re-probe the live file on every call.
 	if s.snap != nil && time.Since(s.snapAt) < snapshotTTL {
-		return s.snap.Query(q, args...)
+		return s.snap.QueryContext(ctx, q, args...)
 	}
 
 	// 2. The live file. This is the common case, including while Thunderbird
 	// runs: plain WAL readers coexist with an active writer just fine.
-	rows, err := s.live.Query(q, args...)
+	rows, err := s.live.QueryContext(ctx, q, args...)
 	if err == nil {
 		return rows, nil
 	}
@@ -119,7 +127,7 @@ func (s *dbSource) Query(q string, args ...any) (*sql.Rows, error) {
 	if err := s.refreshSnapshot(); err != nil {
 		return nil, err
 	}
-	rows, err = s.snap.Query(q, args...)
+	rows, err = s.snap.QueryContext(ctx, q, args...)
 	if err == nil || !isTorn(err) {
 		return rows, err
 	}
@@ -129,7 +137,7 @@ func (s *dbSource) Query(q string, args ...any) (*sql.Rows, error) {
 	if err := s.makeSnapshotNow(); err != nil {
 		return nil, err
 	}
-	return s.snap.Query(q, args...)
+	return s.snap.QueryContext(ctx, q, args...)
 }
 
 // queryOne is Query plus the sql.Row shape: it scans the first row into dest

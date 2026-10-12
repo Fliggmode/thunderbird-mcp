@@ -40,3 +40,6 @@ IMAP accounts only (local folders are read-only). `send_*`/`save_draft` require
 | `list_events` | `since?`, `until?` (RFC3339 or `YYYY-MM-DD`; default: now → +30 days), `limit?` |
 
 Dates accept RFC3339 or `YYYY-MM-DD`.
+
+Calendar ranges use overlap and an exclusive RFC3339 `until`. Date-only `until` includes the whole UTC date.
+See [calendar ranges and recurrence](calendar.md) for bounds, timezone policy, and unsupported recurrence forms.

@@ -294,9 +294,9 @@ type ListCalendarsOutput struct {
 }
 
 type ListEventsInput struct {
-	Since string `json:"since,omitempty" jsonschema:"RFC3339 or YYYY-MM-DD; defaults to now"`
-	Until string `json:"until,omitempty" jsonschema:"RFC3339 or YYYY-MM-DD; defaults to 30 days out"`
-	Limit int    `json:"limit,omitempty"`
+	Since string `json:"since,omitempty" jsonschema:"Overlap range start: RFC3339 or YYYY-MM-DD at UTC midnight; defaults to now"`
+	Until string `json:"until,omitempty" jsonschema:"Exclusive RFC3339 end or inclusive YYYY-MM-DD UTC date; defaults to +30 days; positive range at most 366 days"`
+	Limit int    `json:"limit,omitempty" jsonschema:"Default 50; maximum 1000 results"`
 }
 type ListEventsOutput struct {
 	Events []CalendarEvent `json:"events"`
@@ -357,9 +357,9 @@ type ContactsOutput struct {
 
 type CalendarInput struct {
 	Action string `json:"action" jsonschema:"list_calendars or list_events"`
-	Since  string `json:"since,omitempty" jsonschema:"list_events: RFC3339 or YYYY-MM-DD; defaults to now"`
-	Until  string `json:"until,omitempty" jsonschema:"list_events: RFC3339 or YYYY-MM-DD; defaults to +30 days"`
-	Limit  int    `json:"limit,omitempty"`
+	Since  string `json:"since,omitempty" jsonschema:"list_events: overlap range start; RFC3339 or YYYY-MM-DD at UTC midnight; defaults to now"`
+	Until  string `json:"until,omitempty" jsonschema:"list_events: exclusive RFC3339 end or inclusive YYYY-MM-DD UTC date; defaults to +30 days; positive range at most 366 days"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"list_events: default 50; maximum 1000 results"`
 }
 type CalendarOutput struct {
 	Calendars []CalendarRef   `json:"calendars,omitempty"`
