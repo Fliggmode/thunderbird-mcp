@@ -11,6 +11,7 @@ import (
 )
 
 // Thunderbird constants: see docs/calendar.md for immutable upstream sources.
+const calendarRecurrenceIDAllDay = 512
 const calendarAllDay = 8
 const calendarHasRecurrence = 16
 const calendarOfflineDeleted = 4
@@ -67,6 +68,32 @@ func calendarZone(tz string) (*time.Location, error) {
 	}
 	return loc, nil
 }
+
+// Use the same identity for storage version selection and generated overlays.
+// Zoned nativeTime values already represent UTC instants. Floating values retain
+// their wall-clock identity; DATE values retain their civil date, not an instant.
+func canonicalCalendarIdentity(k calendarIdentity, dateOnly bool) (calendarIdentity, error) {
+	if !k.recurrence.Valid {
+		k.timezone = sql.NullString{}
+		return k, nil
+	}
+	loc, err := calendarZone(k.timezone.String)
+	if err != nil {
+		return k, err
+	}
+	kind := "instant"
+	if k.timezone.String == "floating" {
+		kind = "floating"
+	}
+	if dateOnly {
+		kind = "date"
+		dt := time.UnixMicro(k.recurrence.Int64).In(loc)
+		k.recurrence.Int64 = time.Date(dt.Year(), dt.Month(), dt.Day(), 0, 0, 0, 0, time.UTC).UnixMicro()
+	}
+	k.timezone = sql.NullString{String: kind, Valid: true}
+	return k, nil
+}
+
 func calendarOverlap(v storedCalendarEvent, a, b time.Time) bool {
 	if v.deleted || !v.event.Start.Before(b) {
 		return false
@@ -132,8 +159,7 @@ func calendarRules(ctx context.Context, b *calendarBudget, v storedCalendarEvent
 }
 func expandCalendar(ctx context.Context, b *calendarBudget, merged map[calendarIdentity]storedCalendarEvent, since, until time.Time) ([]storedCalendarEvent, error) {
 	var out []storedCalendarEvent
-	exceptions := map[string]map[int64]storedCalendarEvent{}
-	group := func(k calendarIdentity) string { return fmt.Sprintf("%d:%s%s", len(k.calID), k.calID, k.uid) }
+	exceptions := map[calendarIdentity]bool{}
 	for k, v := range merged {
 		if e := b.step(ctx); e != nil {
 			return nil, e
@@ -145,11 +171,7 @@ func expandCalendar(ctx context.Context, b *calendarBudget, merged map[calendarI
 		}
 		merged[k] = v
 		if k.recurrence.Valid {
-			g := group(k)
-			if exceptions[g] == nil {
-				exceptions[g] = map[int64]storedCalendarEvent{}
-			}
-			exceptions[g][k.recurrence.Int64] = v
+			exceptions[k] = true
 		}
 	}
 	for k, v := range merged {
@@ -275,7 +297,14 @@ func expandCalendar(ctx context.Context, b *calendarBudget, merged map[calendarI
 			if excluded[id] {
 				continue
 			}
-			if _, ok := exceptions[group(k)][id]; ok {
+			identity := k
+			identity.recurrence = sql.NullInt64{Int64: id, Valid: true}
+			identity.timezone = sql.NullString{String: v.startTZ, Valid: true}
+			identity, err := canonicalCalendarIdentity(identity, v.flags&calendarAllDay != 0)
+			if err != nil {
+				return nil, err
+			}
+			if exceptions[identity] {
 				continue
 			}
 			occ := v

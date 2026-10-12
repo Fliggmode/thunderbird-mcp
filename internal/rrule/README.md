@@ -3,7 +3,7 @@
 This directory contains teambition/rrule-go v1.8.2, pinned to commit
 `429348ca4477691b08edb0200b7f837edd32414c`.
 Source: https://github.com/teambition/rrule-go/tree/429348ca4477691b08edb0200b7f837edd32414c
-The upstream BSD license and regression tests accompany the source.
+The upstream MIT license and regression tests accompany the source.
 
 Local changes add `RRule.Work` and `RRule.Err`. The iterator calls `Work`
 before every frequency period, including periods with no matches.

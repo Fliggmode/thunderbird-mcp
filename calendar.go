@@ -143,9 +143,9 @@ func (s calendarSource) events(ctx context.Context, budget *calendarBudget, name
 		if err := rows.Scan(&v.key.calID, &v.key.uid, &title, &start, &end, &modified, &v.key.recurrence, &v.key.timezone, &loc, &startTZ, &endTZ, &flags, &offline, &status); err != nil {
 			return nil, err
 		}
-		// Master rows have no recurrence identity, regardless of an unused TZ value.
-		if !v.key.recurrence.Valid {
-			v.key.timezone = sql.NullString{}
+		v.key, err = canonicalCalendarIdentity(v.key, flags.Int64&calendarRecurrenceIDAllDay != 0)
+		if err != nil {
+			return nil, err
 		}
 		name := names[v.key.calID]
 		if name == "" {
