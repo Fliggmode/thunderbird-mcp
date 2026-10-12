@@ -539,7 +539,7 @@ func ListCalendars(_ context.Context, _ *mcp.CallToolRequest, _ ListCalendarsInp
 	return nil, ListCalendarsOutput{Calendars: app.Config.Calendars}, nil
 }
 
-func ListEvents(_ context.Context, _ *mcp.CallToolRequest, in ListEventsInput) (*mcp.CallToolResult, ListEventsOutput, error) {
+func ListEvents(ctx context.Context, _ *mcp.CallToolRequest, in ListEventsInput) (*mcp.CallToolResult, ListEventsOutput, error) {
 	if app.calendarErr != nil {
 		return nil, ListEventsOutput{}, app.calendarErr
 	}
@@ -560,7 +560,10 @@ func ListEvents(_ context.Context, _ *mcp.CallToolRequest, in ListEventsInput) (
 	if until.IsZero() {
 		until = since.AddDate(0, 0, 30)
 	}
-	res, err := app.Calendar.Events(since, until, in.Limit)
+	if len(in.Until) == 10 {
+		until = until.AddDate(0, 0, 1)
+	}
+	res, err := app.Calendar.EventsContext(ctx, since, until, in.Limit)
 	if err != nil {
 		return nil, ListEventsOutput{}, err
 	}

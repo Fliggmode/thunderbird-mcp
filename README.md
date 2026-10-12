@@ -21,7 +21,7 @@ It works with any MCP client and is designed to pair with [LocalAI](https://loca
 | Full-text search index | `global-messages-db.sqlite` (gloda) | read-only |
 | Credentials | `key4.db` + `logins.json` (NSS) | read-only, decrypted in pure Go |
 | Contacts | `abook.sqlite` | read-only |
-| Calendar | `calendar-data/local.sqlite` | read-only |
+| Calendar | `calendar-data/local.sqlite`, `calendar-data/cache.sqlite` | read-only |
 | Live mail | IMAP / SMTP | fetch, mutate, send |
 
 It is a single, static, **CGO-free** Go binary.
@@ -42,6 +42,8 @@ Three domain tools, each driven by an `action` enum:
 `list_calendars`, `list_events`
 
 The `action` enum is built **dynamically**: write actions (`set_flags`/`move_message`/`delete_message`) appear only when writes are allowed, and send actions (`send_mail`/`reply_message`/`forward_message`/`save_draft`) only when `THUNDERBIRD_ALLOW_SEND=true`. A disabled action is not even present in the schema.
+
+See [calendar range and recurrence semantics](docs/calendar.md) for calendar limits and timezone policy.
 
 See [docs/tools.md](docs/tools.md) for the full per-action parameter reference.
 

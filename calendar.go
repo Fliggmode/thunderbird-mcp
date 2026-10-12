@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -71,10 +72,14 @@ type calendarIdentity struct {
 	timezone   sql.NullString
 }
 type storedCalendarEvent struct {
-	key      calendarIdentity
-	event    CalendarEvent
-	modified int64
-	local    bool
+	key            calendarIdentity
+	event          CalendarEvent
+	modified       int64
+	local          bool
+	flags          int64
+	deleted        bool
+	startTZ, endTZ string
+	source         *dbSource
 }
 
 // Inspect columns rather than retrying failed queries: missing optional columns
@@ -96,7 +101,7 @@ func calendarColumns(src *dbSource, table string) (map[string]bool, error) {
 	return out, rows.Err()
 }
 
-func (s calendarSource) events(names map[string]string) ([]storedCalendarEvent, error) {
+func (s calendarSource) events(ctx context.Context, budget *calendarBudget, names map[string]string) ([]storedCalendarEvent, error) {
 	cols, err := calendarColumns(s.db, "cal_events")
 	if err != nil {
 		return nil, err
@@ -119,8 +124,8 @@ func (s calendarSource) events(names map[string]string) ([]storedCalendarEvent, 
 	}
 	// A scalar subquery prevents duplicate properties from duplicating events.
 	q := `SELECT e.cal_id, e.id, e.title, e.event_start, e.event_end, ` + optional("last_modified") + "," + optional("recurrence_id") + "," + optional("recurrence_id_tz") + `,
- (SELECT p.value FROM cal_properties p WHERE p.item_id=e.id AND p.cal_id=e.cal_id AND p.key='LOCATION'` + join + ` ORDER BY p.value LIMIT 1) FROM cal_events e`
-	rows, err := s.db.Query(q)
+ (SELECT p.value FROM cal_properties p WHERE p.item_id=e.id AND p.cal_id=e.cal_id AND p.key='LOCATION'` + join + ` ORDER BY p.value LIMIT 1),` + optional("event_start_tz") + "," + optional("event_end_tz") + "," + optional("flags") + "," + optional("offline_journal") + "," + optional("ical_status") + ` FROM cal_events e LIMIT 10001`
+	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -130,8 +135,12 @@ func (s calendarSource) events(names map[string]string) ([]storedCalendarEvent, 
 		var v storedCalendarEvent
 		var title, loc sql.NullString
 		var start, end int64
-		var modified sql.NullInt64
-		if err := rows.Scan(&v.key.calID, &v.key.uid, &title, &start, &end, &modified, &v.key.recurrence, &v.key.timezone, &loc); err != nil {
+		var modified, flags, offline sql.NullInt64
+		var startTZ, endTZ, status sql.NullString
+		if err := budget.row(ctx); err != nil {
+			return nil, err
+		}
+		if err := rows.Scan(&v.key.calID, &v.key.uid, &title, &start, &end, &modified, &v.key.recurrence, &v.key.timezone, &loc, &startTZ, &endTZ, &flags, &offline, &status); err != nil {
 			return nil, err
 		}
 		// Master rows have no recurrence identity, regardless of an unused TZ value.
@@ -144,6 +153,8 @@ func (s calendarSource) events(names map[string]string) ([]storedCalendarEvent, 
 		}
 		v.event = CalendarEvent{ID: v.key.uid, Calendar: name, Title: title.String, Location: loc.String, Start: time.UnixMicro(start).UTC(), End: time.UnixMicro(end).UTC()}
 		v.modified, v.local = modified.Int64, s.local
+		v.flags, v.deleted = flags.Int64, offline.Int64 == calendarOfflineDeleted || status.String == "CANCELLED"
+		v.startTZ, v.endTZ, v.source = startTZ.String, endTZ.String, s.db
 		out = append(out, v)
 	}
 	return out, rows.Err()
@@ -182,15 +193,31 @@ func eventLess(a, b storedCalendarEvent) bool {
 }
 
 func (c *Calendar) Events(since, until time.Time, limit int) ([]CalendarEvent, error) {
+	return c.EventsContext(context.Background(), since, until, limit)
+}
+
+func (c *Calendar) EventsContext(ctx context.Context, since, until time.Time, limit int) ([]CalendarEvent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !until.After(since) || until.Sub(since) > 366*24*time.Hour {
+		return nil, fmt.Errorf("calendar range must be positive and at most 366 days")
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
 	if c == nil {
 		return nil, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	budget := &calendarBudget{}
 	if limit <= 0 {
 		limit = 50
 	}
 	merged := map[calendarIdentity]storedCalendarEvent{}
 	for _, src := range c.sources {
-		events, err := src.events(c.names)
+		events, err := src.events(ctx, budget, c.names)
 		if err != nil {
 			return nil, fmt.Errorf("calendar %s: %w", src.db.path, err)
 		}
@@ -201,13 +228,9 @@ func (c *Calendar) Events(since, until time.Time, limit int) ([]CalendarEvent, e
 			}
 		}
 	}
-	// Resolve versions before filtering: an obsolete in-range copy must not
-	// reappear when the winning copy moved outside the requested range.
-	var selected []storedCalendarEvent
-	for _, v := range merged {
-		if !v.event.Start.Before(since) && !v.event.Start.After(until) {
-			selected = append(selected, v)
-		}
+	selected, err := expandCalendar(ctx, budget, merged, since, until)
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(selected, func(i, j int) bool { return eventLess(selected[i], selected[j]) })
 	if len(selected) > limit {
