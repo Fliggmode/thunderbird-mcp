@@ -85,7 +85,7 @@ func run() error {
 
 	server := mcp.NewServer(&mcp.Implementation{Name: "thunderbird", Version: version}, nil)
 
-	mailActions := []any{"list_accounts", "list_folders", "search_messages", "get_message", "list_recent"}
+	mailActions := []any{"list_accounts", "list_folders", "search_messages", "get_message", "list_recent", "get_attachment"}
 	if !app.ReadOnly {
 		mailActions = append(mailActions, "set_flags", "move_message", "delete_message")
 	}
@@ -94,10 +94,28 @@ func run() error {
 	}
 
 	if allowed("thunderbird_mail") {
+		// Mail tool has both read-only and destructive actions;
+		// annotations depend on which actions are enabled (not known until runtime).
+		// We annotate it with DestructiveHint when any destructive action is enabled.
+		var mailAnnotations *mcp.ToolAnnotations
+		if !app.ReadOnly {
+			// Tool can be destructive (set_flags, move_message, delete_message, send_mail, etc.)
+			destructive := true
+			mailAnnotations = &mcp.ToolAnnotations{
+				DestructiveHint: &destructive,
+				ReadOnlyHint:    false,
+			}
+		} else {
+			// Tool is read-only
+			mailAnnotations = &mcp.ToolAnnotations{
+				ReadOnlyHint: true,
+			}
+		}
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "thunderbird_mail",
-			Description: "Thunderbird mail operations. Set `action` to one of the enum values. Read actions (list_accounts, list_folders, search_messages, get_message, list_recent) are always available; set_flags/move_message/delete_message require write access; send_mail/reply_message/forward_message/save_draft require THUNDERBIRD_ALLOW_SEND=true.",
+			Description: "Thunderbird mail operations. Set `action` to one of the enum values. Read actions (list_accounts, list_folders, search_messages, get_message, list_recent, get_attachment) are always available; set_flags/move_message/delete_message require write access; send_mail/reply_message/forward_message/save_draft require THUNDERBIRD_ALLOW_SEND=true.",
 			InputSchema: mustSchema[MailInput](mailActions),
+			Annotations: mailAnnotations,
 		}, ThunderbirdMail)
 	}
 
@@ -106,6 +124,7 @@ func run() error {
 			Name:        "thunderbird_contacts",
 			Description: "Thunderbird address book (read-only). action: search_contacts (by name/email substring) or get_contact (by exact email).",
 			InputSchema: mustSchema[ContactsInput]([]any{"search_contacts", "get_contact"}),
+			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 		}, ThunderbirdContacts)
 	}
 
@@ -114,6 +133,7 @@ func run() error {
 			Name:        "thunderbird_calendar",
 			Description: "Thunderbird calendar (read-only). action: list_calendars or list_events (date range).",
 			InputSchema: mustSchema[CalendarInput]([]any{"list_calendars", "list_events"}),
+			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 		}, ThunderbirdCalendar)
 	}
 

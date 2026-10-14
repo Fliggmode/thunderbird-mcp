@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	gomail "github.com/emersion/go-message/mail"
@@ -60,4 +62,63 @@ func ParseMessage(ref string, raw []byte) (MessageDetail, error) {
 func mustAddrs(h gomail.Header, key string) []*gomail.Address {
 	a, _ := h.AddressList(key)
 	return a
+}
+
+// ExtractAttachment returns the raw content of an attachment at the given index.
+// Uses io.LimitReader to avoid loading huge files entirely into memory.
+// Returns clear errors for invalid indices.
+func ExtractAttachment(raw []byte, index int, limitBytes int) (filename string, contentType string, data []byte, err error) {
+	if index < 0 {
+		return "", "", nil, fmt.Errorf("attachment index must be >= 0, got %d", index)
+	}
+	mr, err := gomail.CreateReader(bytes.NewReader(raw))
+	if err != nil {
+		return "", "", nil, fmt.Errorf("parsing message: %w", err)
+	}
+	attachmentCount := 0
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			// Index not found - provide count in error
+			return "", "", nil, fmt.Errorf("attachment index %d not found (message has %d attachments)", index, attachmentCount)
+		}
+		if err != nil {
+			return "", "", nil, fmt.Errorf("reading message part: %w", err)
+		}
+		if ah, ok := p.Header.(*gomail.AttachmentHeader); ok {
+			if attachmentCount == index {
+				fn, _ := ah.Filename()
+				if fn == "" {
+					fn = fmt.Sprintf("attachment-%d", index)
+				}
+				ct, _, _ := ah.ContentType()
+				if ct == "" {
+					ct = "application/octet-stream"
+				}
+				// Use LimitReader to avoid reading huge files into memory
+				lr := io.LimitReader(p.Body, int64(limitBytes+1))
+				body, err := io.ReadAll(lr)
+				if err != nil {
+					return "", "", nil, fmt.Errorf("reading attachment: %w", err)
+				}
+				if len(body) > limitBytes {
+					return "", "", nil, fmt.Errorf("attachment exceeds size limit: %d bytes > %d bytes", len(body), limitBytes)
+				}
+				return fn, ct, body, nil
+			}
+			attachmentCount++
+		}
+	}
+}
+
+// SanitizeFilename removes path separators from a filename to prevent traversal attacks.
+func SanitizeFilename(fn string) string {
+	// Keep only the base filename, stripping any directory components.
+	// Handle both Unix and Windows path separators.
+	fn = filepath.Base(fn)
+	// Also handle Windows backslashes on non-Windows systems
+	if strings.ContainsRune(fn, '\\') {
+		fn = filepath.Base(strings.ReplaceAll(fn, "\\", "/"))
+	}
+	return fn
 }

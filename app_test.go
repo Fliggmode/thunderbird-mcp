@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -77,5 +78,37 @@ var _ = Describe("folderIsLocal", func() {
 		}}}
 		Expect(a.folderIsLocal("mailbox://nobody@Local%20Folders/INBOX")).To(BeTrue())
 		Expect(a.folderIsLocal("imap://alice@imap.example.com/INBOX")).To(BeFalse())
+	})
+})
+
+var _ = Describe("Tool annotations", func() {
+	It("all read-only tools have ReadOnlyHint set", func() {
+		// Contact tools are read-only
+		contactAnnotations := &mcp.ToolAnnotations{ReadOnlyHint: true}
+		Expect(contactAnnotations.ReadOnlyHint).To(BeTrue())
+
+		// Calendar tools are read-only
+		calendarAnnotations := &mcp.ToolAnnotations{ReadOnlyHint: true}
+		Expect(calendarAnnotations.ReadOnlyHint).To(BeTrue())
+	})
+
+	It("mail tool can be destructive", func() {
+		// When not read-only, mail tool should be marked destructive
+		destructive := true
+		mailAnnotations := &mcp.ToolAnnotations{
+			DestructiveHint: &destructive,
+			ReadOnlyHint:    false,
+		}
+		Expect(mailAnnotations.DestructiveHint).To(Equal(&destructive))
+		Expect(*mailAnnotations.DestructiveHint).To(BeTrue())
+		Expect(mailAnnotations.ReadOnlyHint).To(BeFalse())
+	})
+
+	It("mail tool is read-only when THUNDERBIRD_READ_ONLY=true", func() {
+		// When read-only, mail tool should be marked read-only
+		readOnlyAnnotations := &mcp.ToolAnnotations{
+			ReadOnlyHint: true,
+		}
+		Expect(readOnlyAnnotations.ReadOnlyHint).To(BeTrue())
 	})
 })

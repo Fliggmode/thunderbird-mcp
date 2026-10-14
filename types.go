@@ -303,6 +303,21 @@ type ListEventsOutput struct {
 	Count  int             `json:"count"`
 }
 
+// --- Tool I/O types (get_attachment) ---
+
+type GetAttachmentInput struct {
+	MessageRef string `json:"message_ref" jsonschema:"reference returned by search_messages or list_recent"`
+	Index      int    `json:"index" jsonschema:"zero-based attachment index from get_message metadata"`
+}
+type GetAttachmentOutput struct {
+	Attachment AttachmentData `json:"attachment"`
+}
+type AttachmentData struct {
+	Filename string `json:"filename"`
+	MimeType string `json:"mime_type"`
+	Data     string `json:"data" jsonschema:"base64-encoded content"`
+}
+
 // --- Consolidated domain tool I/O types ---
 
 type MailInput struct {
@@ -317,8 +332,9 @@ type MailInput struct {
 	Until       string   `json:"until,omitempty" jsonschema:"search_messages: RFC3339 or YYYY-MM-DD upper bound"`
 	Limit       int      `json:"limit,omitempty"`
 	Offset      int      `json:"offset,omitempty"`
-	MessageRef  string   `json:"message_ref,omitempty" jsonschema:"get_message/set_flags/move_message/delete_message/reply_message/forward_message: reference from search_messages"`
+	MessageRef  string   `json:"message_ref,omitempty" jsonschema:"get_message/set_flags/move_message/delete_message/reply_message/forward_message/get_attachment: reference from search_messages"`
 	BodyFormat  string   `json:"body_format,omitempty" jsonschema:"get_message: text (default) or html"`
+	Index       int      `json:"index,omitempty" jsonschema:"get_attachment: zero-based attachment index"`
 	Read        *bool    `json:"read,omitempty" jsonschema:"set_flags: mark read (true) or unread (false)"`
 	Flagged     *bool    `json:"flagged,omitempty" jsonschema:"set_flags: set or clear the star"`
 	AddTags     []string `json:"add_tags,omitempty" jsonschema:"set_flags: tags to add"`
@@ -334,12 +350,13 @@ type MailInput struct {
 }
 
 type MailOutput struct {
-	Accounts []AccountInfo    `json:"accounts,omitempty"`
-	Folders  []FolderInfo     `json:"folders,omitempty"`
-	Messages []MessageSummary `json:"messages,omitempty"`
-	Message  *MessageDetail   `json:"message,omitempty"`
-	Count    int              `json:"count,omitempty"`
-	Success  bool             `json:"success,omitempty"`
+	Accounts   []AccountInfo    `json:"accounts,omitempty"`
+	Folders    []FolderInfo     `json:"folders,omitempty"`
+	Messages   []MessageSummary `json:"messages,omitempty"`
+	Message    *MessageDetail   `json:"message,omitempty"`
+	Attachment *AttachmentData  `json:"attachment,omitempty"`
+	Count      int              `json:"count,omitempty"`
+	Success    bool             `json:"success,omitempty"`
 }
 
 type ContactsInput struct {

@@ -33,7 +33,7 @@ It is a single, static, **CGO-free** Go binary.
 Three domain tools, each driven by an `action` enum:
 
 ### `thunderbird_mail`
-`list_accounts`, `list_folders`, `search_messages`, `get_message`, `list_recent`, `set_flags`, `move_message`, `delete_message`, `send_mail`, `reply_message`, `forward_message`, `save_draft`
+`list_accounts`, `list_folders`, `search_messages`, `get_message`, `list_recent`, `get_attachment`, `set_flags`, `move_message`, `delete_message`, `send_mail`, `reply_message`, `forward_message`, `save_draft`
 
 ### `thunderbird_contacts`
 `search_contacts`, `get_contact`

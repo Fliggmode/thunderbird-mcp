@@ -214,3 +214,54 @@ var _ = Describe("mustSchema", func() {
 		Expect(s.Properties).To(HaveKey("action"))
 	})
 })
+
+var _ = Describe("GetAttachment handler", func() {
+	It("rejects negative index", func() {
+		_, err := GetAttachment(context.Background(), nil, GetAttachmentInput{
+			MessageRef: "imap://alice@imap.example.com/INBOX#1", Index: -1,
+		})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("index must be >= 0"))
+	})
+
+	It("rejects invalid message_ref", func() {
+		_, err := GetAttachment(context.Background(), nil, GetAttachmentInput{
+			MessageRef: "invalid", Index: 0,
+		})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid message_ref"))
+	})
+
+	It("returns error for missing attachment on valid message", func() {
+		// Create minimal app with no IMAP connection available
+		app = &App{Config: &Config{Accounts: []Account{{Type: "none", Hostname: "Local Folders"}}}}
+		app.IMAP = NewIMAP(app.Config, &Credentials{})
+		_, err := GetAttachment(context.Background(), nil, GetAttachmentInput{
+			MessageRef: "mailbox://nobody@Local%20Folders/INBOX#1", Index: 0,
+		})
+		// Will fail with file not found since the test mbox doesn't exist
+		Expect(err).To(HaveOccurred())
+	})
+
+
+	It("respects THUNDERBIRD_MAX_ATTACHMENT_BYTES environment variable", func() {
+		// Test that size limit can be overridden
+		os.Setenv("THUNDERBIRD_MAX_ATTACHMENT_BYTES", "1000")
+		defer os.Unsetenv("THUNDERBIRD_MAX_ATTACHMENT_BYTES")
+		Expect(getAttachmentSizeLimit()).To(Equal(1000))
+
+		// Reset to default
+		os.Unsetenv("THUNDERBIRD_MAX_ATTACHMENT_BYTES")
+		Expect(getAttachmentSizeLimit()).To(Equal(defaultAttachmentSizeLimit))
+	})
+
+	It("falls back to default on invalid THUNDERBIRD_MAX_ATTACHMENT_BYTES", func() {
+		os.Setenv("THUNDERBIRD_MAX_ATTACHMENT_BYTES", "invalid")
+		defer os.Unsetenv("THUNDERBIRD_MAX_ATTACHMENT_BYTES")
+		Expect(getAttachmentSizeLimit()).To(Equal(defaultAttachmentSizeLimit))
+
+		os.Setenv("THUNDERBIRD_MAX_ATTACHMENT_BYTES", "-1000")
+		defer os.Unsetenv("THUNDERBIRD_MAX_ATTACHMENT_BYTES")
+		Expect(getAttachmentSizeLimit()).To(Equal(defaultAttachmentSizeLimit))
+	})
+})
