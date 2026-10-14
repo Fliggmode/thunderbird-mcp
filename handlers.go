@@ -256,6 +256,11 @@ func getAttachmentSizeLimit() int {
 }
 
 func GetAttachment(_ context.Context, _ *mcp.CallToolRequest, in GetAttachmentInput) (*mcp.CallToolResult, error) {
+	// Validate index first, before any app access
+	if in.Index < 0 {
+		return nil, fmt.Errorf("attachment index must be >= 0, got %d", in.Index)
+	}
+
 	limitBytes := getAttachmentSizeLimit()
 
 	ref, err := ParseMessageRef(in.MessageRef)
